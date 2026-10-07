@@ -13,7 +13,8 @@ from typing import Annotated, Optional
 import typer
 from rich.console import Console
 
-from ...services.config_service import Config
+from ...services.config_service import Config, LibraryDict
+from ...utils.metadata import read_cloud_metadata
 
 console = Console()
 
@@ -114,11 +115,13 @@ _MODEL_PATH_RE = re.compile(
 )
 
 
-def _fix_3d_path(text: str, models_dir_name: str) -> str:
+def _fix_3d_path(text: str, model_prefix: str) -> str:
+    """Point every model path at model_prefix, e.g. "${KICAD_3D_MYLIB}"."""
+
     def _replace(m: re.Match[str]) -> str:
         raw = m.group(1) if m.group(1) is not None else m.group(2)
         filename = Path(raw).name
-        return f'(model "${{KICAD_3RD_PARTY}}/{models_dir_name}/{filename}"'
+        return f'(model "{model_prefix}/{filename}"'
 
     return _MODEL_PATH_RE.sub(_replace, text)
 
@@ -215,7 +218,7 @@ def _import_zip(
     sym_lib: Path,
     fp_dir: Path,
     models_dir: Path,
-    lib_name: str,
+    model_prefix: str,
     kicad_cli: Optional[Path],
     dry_run: bool,
 ) -> dict[str, list[str]]:
@@ -225,7 +228,6 @@ def _import_zip(
         "fp": [],
         "models": [],
     }
-    models_dir_name = models_dir.name
 
     with tempfile.TemporaryDirectory(prefix="kilm_import_") as tmp:
         tmp_path = Path(tmp)
@@ -260,7 +262,7 @@ def _import_zip(
                 continue
             console.print(f"  FP   add: {f.name}")
             if not dry_run:
-                text = _fix_3d_path(f.read_text(encoding="utf-8"), models_dir_name)
+                text = _fix_3d_path(f.read_text(encoding="utf-8"), model_prefix)
                 f.write_text(text, encoding="utf-8")
                 _upgrade_fp(f, kicad_cli)
                 fp_dir.mkdir(exist_ok=True)
@@ -271,7 +273,7 @@ def _import_zip(
         for f in tmp_path.rglob("*.kicad_sym"):
             if not dry_run:
                 _upgrade_sym(f, kicad_cli)
-            added, skipped = _merge_symbols(f, sym_lib, lib_name, dry_run)
+            added, skipped = _merge_symbols(f, sym_lib, fp_dir.stem, dry_run)
             for name in added:
                 console.print(f"  SYM  add: {name}")
             for name in skipped:
@@ -303,6 +305,48 @@ def _detect_kicad_cli() -> Optional[Path]:
     return None
 
 
+def _pick_lib(
+    candidates: list[Path], name: Optional[str], kind: str, option: str
+) -> Path:
+    """Return the library called name, or the only candidate when name is None."""
+    available = ", ".join(c.stem for c in candidates)
+    if name is not None:
+        for c in candidates:
+            if c.stem == name:
+                return c
+        console.print(f"[red]No {kind} library '{name}'. Available: {available}[/red]")
+        raise typer.Exit(1)
+    if len(candidates) == 1:
+        return candidates[0]
+    console.print(
+        f"[red]Several {kind} libraries found, choose one with {option}: {available}[/red]"
+    )
+    raise typer.Exit(1)
+
+
+def _resolve_models(
+    lib_path: Path, lib_name: str, cloud_libs: list[LibraryDict]
+) -> tuple[Path, str]:
+    """Return (models dir, model path prefix).
+
+    A 3D library registered with 'kilm add-3d' inside lib_path is used via its
+    environment variable; otherwise fall back to <lib_name>.3dshapes under
+    ${KICAD_3RD_PARTY}.
+    """
+    for lib in cloud_libs:
+        models_dir = Path(lib["path"])
+        if not models_dir.is_relative_to(lib_path):
+            continue
+        metadata = read_cloud_metadata(models_dir) or {}
+        env_var = metadata.get("env_var")
+        if isinstance(env_var, str) and env_var:
+            return models_dir, f"${{{env_var}}}"
+    return (
+        lib_path / f"{lib_name}.3dshapes",
+        f"${{KICAD_3RD_PARTY}}/{lib_name}.3dshapes",
+    )
+
+
 def import_zip(
     zip_files: Annotated[
         list[Path],
@@ -316,6 +360,22 @@ def import_zip(
             "--library",
             "-l",
             help="Target library name (default: first github library)",
+        ),
+    ] = None,
+    symbol_lib: Annotated[
+        Optional[str],
+        typer.Option(
+            "--symbol-lib",
+            "-s",
+            help="Symbol library to add to, e.g. MyLib_IC (required if there are several)",
+        ),
+    ] = None,
+    footprint_lib: Annotated[
+        Optional[str],
+        typer.Option(
+            "--footprint-lib",
+            "-f",
+            help="Footprint library to add to, e.g. MyLib_QFN (required if there are several)",
         ),
     ] = None,
     kicad_cli_path: Annotated[
@@ -382,10 +442,12 @@ def import_zip(
         )
         raise typer.Exit(1)
 
-    sym_lib = sym_candidates[0]
-    fp_dir = fp_candidates[0]
-    lib_name = sym_lib.stem
-    models_dir = lib_path / f"{lib_name}.3dshapes"
+    sym_lib = _pick_lib(sym_candidates, symbol_lib, "symbol", "--symbol-lib")
+    fp_dir = _pick_lib(fp_candidates, footprint_lib, "footprint", "--footprint-lib")
+    models_dir, model_prefix = _resolve_models(
+        lib_path, sym_lib.stem, config.get_libraries(library_type="cloud")
+    )
+    console.print(f"[dim]Target: {sym_lib.stem} / {fp_dir.stem} / {model_prefix}[/dim]")
 
     # Resolve kicad-cli
     kicad_cli = kicad_cli_path if kicad_cli_path else _detect_kicad_cli()
@@ -411,7 +473,7 @@ def import_zip(
         console.print(f"\n[cyan]Importing {zip_path.name}[/cyan]")
         try:
             r = _import_zip(
-                zip_path, sym_lib, fp_dir, models_dir, lib_name, kicad_cli, dry_run
+                zip_path, sym_lib, fp_dir, models_dir, model_prefix, kicad_cli, dry_run
             )
         except Exception as exc:
             console.print(f"[red]  error: {zip_path.name}: {exc}[/red]")

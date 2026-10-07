@@ -99,7 +99,7 @@ def test_safe_extractall_rejects_zip_slip(tmp_path: Path):
 
 def test_fix_3d_path_normalises():
     text = '(model "C:/SamacSys/somepart.stp"'
-    result = _fix_3d_path(text, "SAMPLELIB.3dshapes")
+    result = _fix_3d_path(text, "${KICAD_3RD_PARTY}/SAMPLELIB.3dshapes")
     assert "${KICAD_3RD_PARTY}/SAMPLELIB.3dshapes/somepart.stp" in result
 
 
@@ -119,7 +119,7 @@ def test_fix_3d_path_handles_all_extensions_without_truncation(raw: str):
     # Regression: chained re.sub passes (or misordered alternation) previously
     # matched a compound extension's own prefix (e.g. "step" inside
     # "step.gz"), leaving the rest of the extension as dangling text.
-    result = _fix_3d_path(raw, "SAMPLELIB.3dshapes")
+    result = _fix_3d_path(raw, "${KICAD_3RD_PARTY}/SAMPLELIB.3dshapes")
     assert result.count('"') == 2
     assert result.endswith('"')
 
@@ -253,8 +253,10 @@ def library_tree(tmp_path: Path) -> Path:
 @pytest.fixture
 def mock_config(library_tree: Path, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     config_mock = MagicMock()
-    config_mock.get_libraries.return_value = [
-        {"name": "mylib", "path": str(library_tree), "type": "github"}
+    libs = [{"name": "mylib", "path": str(library_tree), "type": "github"}]
+    config_mock.libs = libs
+    config_mock.get_libraries.side_effect = lambda library_type=None: [
+        lib for lib in libs if library_type in (None, lib["type"])
     ]
     monkeypatch.setattr(
         "kicad_lib_manager.commands.import_zip.command.Config", lambda: config_mock
@@ -366,3 +368,76 @@ def test_import_zip_cli_skips_existing(
 
     assert result.exit_code == 0, result.output
     assert "skip (exists): ExistingPart" in result.output
+
+
+# ── Category libraries ────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def category_tree(library_tree: Path, mock_config: MagicMock) -> Path:
+    """Split library: two symbol libs, two footprint libs, a registered 3D lib."""
+    (library_tree / "symbols" / "CAT_IC.kicad_sym").write_text(
+        SAMPLE_SYM_LIB, encoding="utf-8"
+    )
+    (library_tree / "footprints" / "CAT_QFN.pretty").mkdir()
+    models = library_tree / "CAT.3dshapes"
+    models.mkdir()
+    (models / ".kilm_metadata").write_text(
+        '{"env_var": "KICAD_3D_CAT_MODELS"}', encoding="utf-8"
+    )
+    mock_config.libs.append({"name": "cat-3d", "path": str(models), "type": "cloud"})
+    return library_tree
+
+
+def _run_import(*args: str):
+    with patch(
+        "kicad_lib_manager.commands.import_zip.command._detect_kicad_cli",
+        return_value=None,
+    ):
+        return runner.invoke(app, ["import", *args])
+
+
+def test_import_zip_requires_lib_choice_when_several(
+    tmp_path: Path, category_tree: Path
+):
+    result = _run_import(str(_make_samacsys_zip(tmp_path, "AmbPart")))
+
+    assert result.exit_code == 1
+    assert "--symbol-lib" in result.output
+    assert "CAT_IC" in result.output
+
+
+def test_import_zip_unknown_lib_lists_available(tmp_path: Path, category_tree: Path):
+    result = _run_import(
+        "--symbol-lib",
+        "NOPE",
+        "--footprint-lib",
+        "CAT_QFN",
+        str(_make_samacsys_zip(tmp_path, "XPart")),
+    )
+
+    assert result.exit_code == 1
+    assert "No symbol library 'NOPE'" in result.output
+
+
+def test_import_zip_into_category_libs(tmp_path: Path, category_tree: Path):
+    zip_path = _make_samacsys_zip(tmp_path, "CatPart")
+    with zipfile.ZipFile(zip_path, "a") as zf:
+        zf.writestr(
+            "CatPart/KiCad/CatPartFP.kicad_mod",
+            '(footprint "CatPartFP"\n\t(model "C:/x/CatPart.stp"\n\t)\n)\n',
+        )
+
+    result = _run_import("-s", "CAT_IC", "-f", "CAT_QFN", str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    sym_text = (category_tree / "symbols" / "CAT_IC.kicad_sym").read_text()
+    assert '"Footprint" "CAT_QFN:CatPart"' in sym_text
+    assert (
+        "CatPart" not in (category_tree / "symbols" / "SAMPLELIB.kicad_sym").read_text()
+    )
+
+    fp = category_tree / "footprints" / "CAT_QFN.pretty" / "CatPartFP.kicad_mod"
+    assert '(model "${KICAD_3D_CAT_MODELS}/CatPart.stp"' in fp.read_text()
+    assert (category_tree / "CAT.3dshapes" / "CatPart.stp").exists()
+    assert not (category_tree / "CAT_IC.3dshapes").exists()
