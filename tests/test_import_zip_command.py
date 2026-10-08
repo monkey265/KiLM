@@ -580,3 +580,20 @@ def test_import_zip_skips_parts_already_in_another_category(
     assert not (
         category_tree / "footprints" / "CAT_QFN.pretty" / "ExistingPart.kicad_mod"
     ).exists()
+
+
+def test_import_zip_rejects_missing_kicad_cli_path(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    zip_path = _make_samacsys_zip(tmp_path, "CliPart")
+
+    result = runner.invoke(
+        app,
+        ["import", "--kicad-cli", str(tmp_path / "nope" / "kicad-cli"), str(zip_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "kicad-cli not found at:" in result.output
+    assert (
+        "CliPart" not in (library_tree / "symbols" / "SAMPLELIB.kicad_sym").read_text()
+    )
