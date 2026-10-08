@@ -277,7 +277,7 @@ def _import_zip(
                 (".stp.gz", ".step.gz")
             ):
                 dest = models_dir / f.name
-                if dest.exists():
+                if dest.exists() or models.get(f.name) == model_prefix:
                     console.print(f"  3D   skip (exists): {f.name}")
                 elif f.name in models:
                     console.print(
@@ -371,7 +371,10 @@ def _dir_prefix(models_dir: Path, lib_env_var: object) -> str:
 
 
 def _resolve_models(
-    lib_path: Path, default_name: str, cloud_libs: list[LibraryDict]
+    lib_path: Path,
+    default_name: str,
+    cloud_libs: list[LibraryDict],
+    metadata: dict[str, object],
 ) -> tuple[Path, str]:
     """Return (models dir, model path prefix) for the whole library.
 
@@ -386,11 +389,10 @@ def _resolve_models(
         models_dir = Path(lib["path"])
         if not models_dir.is_relative_to(lib_path):
             continue
-        metadata = read_cloud_metadata(models_dir) or {}
-        env_var = metadata.get("env_var")
+        cloud_metadata = read_cloud_metadata(models_dir) or {}
+        env_var = cloud_metadata.get("env_var")
         if isinstance(env_var, str) and env_var:
             return models_dir, f"${{{env_var}}}"
-    metadata = read_github_metadata(lib_path) or {}
     existing = sorted(d for d in lib_path.glob("*.3dshapes") if d.is_dir())
     preferred = {default_name, str(metadata.get("name", "")), lib_path.name}
     named = [d for d in existing if d.stem in preferred]
@@ -410,14 +412,13 @@ def _resolve_models(
 
 
 def _existing_models(
-    lib_path: Path, models_dir: Path, model_prefix: str
+    lib_path: Path, models_dir: Path, model_prefix: str, lib_env_var: object
 ) -> dict[str, str]:
     """Model file name -> path prefix, for models already in the library.
 
     Covers the target models dir and every other *.3dshapes dir of the
     library, so an import reuses a model wherever it already lives.
     """
-    lib_env_var = (read_github_metadata(lib_path) or {}).get("env_var")
     dirs = [(models_dir, model_prefix)]
     for d in sorted(lib_path.glob("*.3dshapes")):
         if d.is_dir() and d.resolve() != models_dir.resolve():
@@ -425,8 +426,8 @@ def _existing_models(
     models: dict[str, str] = {}
     for d, prefix in dirs:
         if d.is_dir():
-            for f in d.iterdir():
-                if f.is_file():
+            for f in sorted(d.iterdir()):
+                if f.is_file() and not f.name.startswith("."):
                     models.setdefault(f.name, prefix)
     return models
 
@@ -531,10 +532,16 @@ def import_zip(
     default_models_name = (
         sym_candidates[0].stem if len(sym_candidates) == 1 else lib_path.name
     )
+    lib_metadata = read_github_metadata(lib_path) or {}
     models_dir, model_prefix = _resolve_models(
-        lib_path, default_models_name, config.get_libraries(library_type="cloud")
+        lib_path,
+        default_models_name,
+        config.get_libraries(library_type="cloud"),
+        lib_metadata,
     )
-    models = _existing_models(lib_path, models_dir, model_prefix)
+    models = _existing_models(
+        lib_path, models_dir, model_prefix, lib_metadata.get("env_var")
+    )
     if not all(p.startswith("${") for p in [model_prefix, *models.values()]):
         console.print(
             "[yellow]3D model paths will be absolute to this machine. Set env_var "

@@ -641,3 +641,28 @@ def test_merge_symbols_adds_repeated_name_once(tmp_path: Path):
     assert added == ["Twice"]
     assert skipped == ["Twice"]
     assert sym_lib.read_text().count('(symbol "Twice"') == 1
+
+
+def test_dry_run_reports_model_added_earlier_as_skip(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    a = _zip_with(tmp_path, "a", {"A/3D/Shared.step": "STEP"})
+    b = _zip_with(tmp_path, "b", {"B/3D/Shared.step": "STEP"})
+
+    result = _run_import("--dry-run", str(a), str(b))
+
+    assert "3D   skip (exists): Shared.step" in result.output
+    assert "reuse existing" not in result.output
+
+
+def test_hidden_files_in_model_dirs_are_ignored(tmp_path: Path, category_tree: Path):
+    # A .DS_Store in an extra dir without a library env var must not count as
+    # a model (it would trigger the absolute-path warning on its own).
+    (category_tree / "Old.3dshapes").mkdir()
+    (category_tree / "Old.3dshapes" / ".DS_Store").write_text("x")
+    zip_path = _zip_with(tmp_path, "H", {"H/3D/New.step": "STEP"})
+
+    result = _run_import("-s", "CAT_IC", "-f", "CAT_QFN", str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert "absolute to this machine" not in result.output
