@@ -208,23 +208,28 @@ def _import_zip(
     model_prefix: str,
     kicad_cli: Optional[Path],
     dry_run: bool,
-    known_symbols: frozenset[str] = frozenset(),
+    known_symbols: Optional[set[str]] = None,
     all_fp_dirs: Optional[list[Path]] = None,
+    run_fps: Optional[dict[str, str]] = None,
+    result: Optional[dict[str, list[str]]] = None,
 ) -> dict[str, list[str]]:
     """Import one ZIP into sym_lib / fp_dir.
 
     Symbols named in known_symbols and footprints present in any of
     all_fp_dirs (the other libraries of a split library) are skipped rather
-    than duplicated.
+    than duplicated. known_symbols and run_fps (footprint name -> library
+    added earlier in this run) are updated in place, so later files and ZIPs
+    see this one's parts even in a dry run. Progress is recorded in result
+    as it happens, so a caller still knows what was written if this raises.
     """
+    known_symbols = known_symbols if known_symbols is not None else set()
+    run_fps = run_fps if run_fps is not None else {}
     fp_dirs = [fp_dir] + [d for d in all_fp_dirs or [] if d != fp_dir]
     fp_libs: dict[str, str] = {}
-    result: dict[str, list[str]] = {
-        "sym": [],
-        "sym_skipped": [],
-        "fp": [],
-        "models": [],
-    }
+    if result is None:
+        result = {}
+    for key in ("sym", "sym_skipped", "fp", "models"):
+        result.setdefault(key, [])
 
     with tempfile.TemporaryDirectory(prefix="kilm_import_") as tmp:
         tmp_path = Path(tmp)
@@ -242,7 +247,7 @@ def _import_zip(
                 (".stp.gz", ".step.gz")
             ):
                 dest = models_dir / f.name
-                if dest.exists():
+                if dest.exists() or f.name in result["models"]:
                     console.print(f"  3D   skip (exists): {f.name}")
                 else:
                     console.print(f"  3D   add: {f.name}")
@@ -260,8 +265,13 @@ def _import_zip(
                 console.print(f"  FP   skip (exists{where}): {f.name}")
                 fp_libs[f.stem] = existing_in.stem
                 continue
+            if f.stem in run_fps:
+                console.print(f"  FP   skip (added earlier in this run): {f.name}")
+                fp_libs[f.stem] = run_fps[f.stem]
+                continue
             console.print(f"  FP   add: {f.name}")
             fp_libs[f.stem] = fp_dir.stem
+            run_fps[f.stem] = fp_dir.stem
             if not dry_run:
                 text = _fix_3d_path(f.read_text(encoding="utf-8"), model_prefix)
                 f.write_text(text, encoding="utf-8")
@@ -275,8 +285,9 @@ def _import_zip(
             if not dry_run:
                 _upgrade_sym(f, kicad_cli)
             added, skipped = _merge_symbols(
-                f, sym_lib, fp_dir.stem, dry_run, known_symbols, fp_libs
+                f, sym_lib, fp_dir.stem, dry_run, frozenset(known_symbols), fp_libs
             )
+            known_symbols.update(added)
             for name in added:
                 console.print(f"  SYM  add: {name}")
             for name in skipped:
@@ -391,7 +402,8 @@ def _resolve_models(
 
     A 3D library registered with 'kilm add-3d' inside lib_path is used via its
     environment variable. Otherwise models go into the library's existing
-    *.3dshapes dir (or <default_name>.3dshapes), referenced through the
+    *.3dshapes dir (one named after the library, or the only one; else
+    <default_name>.3dshapes), referenced through the
     library's own environment variable from kilm.yaml, which 'kilm setup'
     defines in KiCad; without one, the absolute path is used.
     """
@@ -403,9 +415,22 @@ def _resolve_models(
         env_var = metadata.get("env_var")
         if isinstance(env_var, str) and env_var:
             return models_dir, f"${{{env_var}}}"
+    metadata = read_github_metadata(lib_path) or {}
     existing = sorted(d for d in lib_path.glob("*.3dshapes") if d.is_dir())
-    models_dir = existing[0] if existing else lib_path / f"{default_name}.3dshapes"
-    lib_env_var = (read_github_metadata(lib_path) or {}).get("env_var")
+    preferred = {default_name, str(metadata.get("name", "")), lib_path.name}
+    named = [d for d in existing if d.stem in preferred]
+    if named:
+        models_dir = named[0]
+    elif len(existing) == 1:
+        models_dir = existing[0]
+    else:
+        if existing:
+            console.print(
+                f"[yellow]Several *.3dshapes dirs in {lib_path}; register the right "
+                f"one with 'kilm add-3d'. Using {default_name}.3dshapes[/yellow]"
+            )
+        models_dir = lib_path / f"{default_name}.3dshapes"
+    lib_env_var = metadata.get("env_var")
     if isinstance(lib_env_var, str) and lib_env_var:
         return models_dir, f"${{{lib_env_var}}}/{models_dir.name}"
     return models_dir, models_dir.resolve().as_posix()
@@ -510,10 +535,20 @@ def import_zip(
     _check_lib_name(fp_candidates, footprint_lib, "footprint")
     sym_map = _category_map(lib_path, "symbols")
     fp_map = _category_map(lib_path, "footprints")
-    models_dir, model_prefix = _resolve_models(
-        lib_path, sym_candidates[0].stem, config.get_libraries(library_type="cloud")
+    default_models_name = (
+        sym_candidates[0].stem if len(sym_candidates) == 1 else lib_path.name
     )
+    models_dir, model_prefix = _resolve_models(
+        lib_path, default_models_name, config.get_libraries(library_type="cloud")
+    )
+    if not model_prefix.startswith("${"):
+        console.print(
+            "[yellow]3D model paths will be absolute to this machine. Set env_var "
+            "in kilm.yaml (kilm init) or register a 3D library (kilm add-3d) to "
+            "share the library.[/yellow]"
+        )
     known_symbols = _symbol_names(sym_candidates)
+    run_fps: dict[str, str] = {}
 
     # Resolve kicad-cli
     if kicad_cli_path is not None and not kicad_cli_path.exists():
@@ -570,8 +605,9 @@ def import_zip(
         console.print(
             f"[dim]  Target: {sym_lib.stem} / {fp_dir.stem} / {model_prefix}[/dim]"
         )
+        r: dict[str, list[str]] = {}
         try:
-            r = _import_zip(
+            _import_zip(
                 zip_path,
                 sym_lib,
                 fp_dir,
@@ -579,17 +615,23 @@ def import_zip(
                 model_prefix,
                 kicad_cli,
                 dry_run,
-                frozenset(known_symbols),
+                known_symbols,
                 fp_candidates,
+                run_fps,
+                r,
             )
         except Exception as exc:
             console.print(f"[red]  error: {zip_path.name}: {exc}[/red]")
+            written = [f"{len(r.get(k, []))} {k}" for k in ("sym", "fp", "models")]
+            if any(r.get(k) for k in ("sym", "fp", "models")):
+                console.print(
+                    f"[yellow]  partially imported before the error: "
+                    f"{', '.join(written)}[/yellow]"
+                )
             failed.append(zip_path.name)
-            continue
-        known_symbols.update(r["sym"])
-        totals["sym"].extend(r["sym"])
-        totals["fp"].extend(r["fp"])
-        totals["models"].extend(r["models"])
+        totals["sym"].extend(r.get("sym", []))
+        totals["fp"].extend(r.get("fp", []))
+        totals["models"].extend(r.get("models", []))
 
     console.print("\n[bold]Summary:[/bold]")
     console.print(f"  Symbols   added: {len(totals['sym'])}")

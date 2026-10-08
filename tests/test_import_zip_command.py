@@ -720,3 +720,81 @@ def test_unreadable_zip_does_not_abort_batch(
     assert result.exit_code == 1
     assert "Failed: bad.zip" in result.output
     assert "AfterBad" in (library_tree / "symbols" / "SAMPLELIB.kicad_sym").read_text()
+
+
+# ── Review round 2 ────────────────────────────────────────────────────────────
+
+
+def test_dry_run_sees_parts_added_earlier_in_run(tmp_path: Path, category_tree: Path):
+    files = {
+        "X/KiCad/Dup.kicad_sym": '(kicad_symbol_lib\n\t(symbol "Dup"\n\t)\n)\n',
+        "X/KiCad/DupFP.kicad_mod": '(footprint "DupFP")\n',
+    }
+    a = _zip_with(tmp_path, "a", files)
+    b = _zip_with(tmp_path, "b", files)
+
+    result = _run_import("--dry-run", "-s", "CAT_IC", "-f", "CAT_QFN", str(a), str(b))
+
+    assert result.exit_code == 0, result.output
+    assert result.output.count("SYM  add: Dup") == 1
+    assert "SYM  skip (exists): Dup" in result.output
+    assert "skip (added earlier in this run): DupFP.kicad_mod" in result.output
+    assert "Symbols   added: 1" in result.output
+
+
+def test_failed_zip_reports_partial_import(
+    tmp_path: Path,
+    library_tree: Path,
+    mock_config: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def _boom(*args, **kwargs):
+        raise RuntimeError("bad symbol file")
+
+    monkeypatch.setattr(
+        "kicad_lib_manager.commands.import_zip.command._merge_symbols", _boom
+    )
+    zip_path = _make_samacsys_zip(tmp_path, "Half")
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 1
+    assert "partially imported before the error" in result.output
+    assert "Footprints added: 1" in result.output
+    assert (
+        library_tree / "footprints" / "SAMPLELIB.pretty" / "Half.kicad_mod"
+    ).exists()
+
+
+def test_split_library_fallback_models_dir_named_after_library(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    (library_tree / "symbols" / "OTHER.kicad_sym").write_text(SAMPLE_SYM_LIB)
+    zip_path = _zip_with(
+        tmp_path,
+        "M3",
+        {
+            "M3/KiCad/M3.kicad_mod": '(footprint "M3"\n\t(model "M3.stp"\n\t)\n)\n',
+            "M3/3D/M3.stp": "STEP",
+        },
+    )
+
+    result = _run_import("-s", "SAMPLELIB", str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert (library_tree / f"{library_tree.name}.3dshapes" / "M3.stp").exists()
+    assert "3D model paths will be absolute to this machine" in result.output
+
+
+def test_models_dir_prefers_library_named_dir(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    (library_tree / "AAA.3dshapes").mkdir()
+    (library_tree / "SAMPLELIB.3dshapes").mkdir()
+    zip_path = _zip_with(tmp_path, "M4", {"M4/3D/M4.stp": "STEP"})
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert (library_tree / "SAMPLELIB.3dshapes" / "M4.stp").exists()
+    assert not (library_tree / "AAA.3dshapes" / "M4.stp").exists()

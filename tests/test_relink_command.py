@@ -10,7 +10,8 @@ import pytest
 from typer.testing import CliRunner
 
 from kicad_lib_manager.commands.relink.command import (
-    _table_nicknames,
+    _shadowed,
+    _table_entries,
     build_index,
     relink_text,
 )
@@ -154,7 +155,7 @@ def test_table_nicknames_follow_nested_tables(tmp_path: Path):
         ")\n"
     )
 
-    assert _table_nicknames(table, {"SYS": str(tmp_path)}) == {"Package_SO", "Mine"}
+    assert set(_table_entries(table, {"SYS": str(tmp_path)})) == {"Package_SO", "Mine"}
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -235,7 +236,7 @@ def test_table_nicknames_accept_unquoted_entries(tmp_path: Path):
         ")\n"
     )
 
-    assert _table_nicknames(table, {}) == {"Device", "Quoted"}
+    assert set(_table_entries(table, {})) == {"Device", "Quoted"}
 
 
 def test_index_only_uses_registered_dirs(lib_tree: Path):
@@ -270,7 +271,7 @@ def test_project_table_shadowing_managed_nickname_is_foreign(index):
     # The project redefines CAT_RF to its own library, so CAT_RF:ADC1 is not
     # a managed reference that moved and must stay.
     text = '(lib_id "CAT_RF:ADC1")'
-    r = relink_text(text, index, KNOWN_SYM, KNOWN_FP, {}, shadowed={"CAT_RF"})
+    r = relink_text(text, index, KNOWN_SYM, KNOWN_FP, {}, shadowed_sym={"CAT_RF"})
 
     assert r.text == text
 
@@ -301,4 +302,102 @@ def test_relink_cli_refuses_without_global_tables(project: Path, tmp_path: Path)
 
     assert result.exit_code == 1
     assert "global library tables" in result.output
+    assert (project / "board.kicad_sch").read_text() == '(lib_id "OLD:ADC1")\n'
+
+
+# ── Review round 2 ────────────────────────────────────────────────────────────
+
+
+def test_same_named_symbol_and_footprint_libs_are_not_shadowed(
+    lib_tree: Path, tmp_path: Path
+):
+    # CAT_IC exists as both a symbol library and a footprint library.
+    (lib_tree / "footprints" / "CAT_IC.pretty").mkdir()
+    index = build_index([lib_tree], {})
+    sym_entry = {"CAT_IC": str(lib_tree / "symbols" / "CAT_IC.kicad_sym")}
+    fp_entry = {"CAT_IC": str(lib_tree / "footprints" / "CAT_IC.pretty")}
+
+    assert _shadowed(sym_entry, index.managed_symbol_paths, tmp_path) == set()
+    assert _shadowed(fp_entry, index.managed_footprint_paths, tmp_path) == set()
+
+
+def test_footprint_shadow_does_not_disable_symbol_checks(index):
+    r = relink_text(
+        '(lib_id "CAT_RF:ADC1")', index, KNOWN_SYM, KNOWN_FP, {}, shadowed_fp={"CAT_RF"}
+    )
+
+    assert r.text == '(lib_id "CAT_IC:ADC1")'
+
+
+def test_two_broken_cache_entries_are_not_renamed_to_one(index):
+    text = '(lib_symbols\n(symbol "OldA:ADC1"\n)\n(symbol "OldB:ADC1"\n)\n)'
+    r = _relink(text, index)
+
+    assert r.text.count('(symbol "CAT_IC:ADC1"') == 1
+
+
+def test_shadowed_handles_unknown_vars_and_relative_uris(lib_tree: Path):
+    index = build_index([lib_tree], {})
+    paths = index.managed_symbol_paths
+    rel = Path("..") / lib_tree.name / "symbols" / "CAT_IC.kicad_sym"
+    project_dir = lib_tree.parent / "proj"
+
+    assert _shadowed({"CAT_IC": "${NOPE}/CAT_IC.kicad_sym"}, paths, project_dir) == {
+        "CAT_IC"
+    }
+    assert _shadowed({"CAT_IC": str(rel)}, paths, project_dir) == set()
+
+
+def test_nested_table_uses_kicad_install_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from kicad_lib_manager.commands.relink import command
+
+    share = tmp_path / "share" / "kicad"
+    (share / "symbols").mkdir(parents=True)
+    (share / "template").mkdir()
+    (share / "template" / "sym-lib-table").write_text(
+        '(sym_lib_table\n\t(lib (name "Device")(type "KiCad")(uri "x")(options "")(descr ""))\n)\n'
+    )
+    monkeypatch.setattr(command, "_INSTALL_SHARE_DIRS", (str(share),))
+    table = tmp_path / "sym-lib-table"
+    table.write_text(
+        "(sym_lib_table\n"
+        '\t(lib (name "KiCad")(type "Table")(uri "${KICAD10_TEMPLATE_DIR}/sym-lib-table")(options "")(descr ""))\n'
+        ")\n"
+    )
+
+    missing: list[str] = []
+    entries = _table_entries(table, command._kicad_install_vars(), missing=missing)
+
+    assert set(entries) == {"Device"}
+    assert missing == []
+
+
+def test_unresolved_nested_table_is_reported(tmp_path: Path):
+    table = tmp_path / "sym-lib-table"
+    table.write_text(
+        "(sym_lib_table\n"
+        '\t(lib (name "KiCad")(type "Table")(uri "${UNSET}/sym-lib-table")(options "")(descr ""))\n'
+        ")\n"
+    )
+    missing: list[str] = []
+
+    assert _table_entries(table, {}, missing=missing) == {}
+    assert missing == ["${UNSET}/sym-lib-table"]
+
+
+def test_relink_cli_refuses_with_missing_nested_table(project: Path, tmp_path: Path):
+    table = tmp_path / "kicad" / "sym-lib-table"
+    table.write_text(
+        table.read_text().replace(
+            "(sym_lib_table\n",
+            '(sym_lib_table\n\t(lib (name "KiCad")(type "Table")(uri "/no/such/table")(options "")(descr ""))\n',
+        )
+    )
+
+    result = runner.invoke(app, ["relink", str(project)])
+
+    assert result.exit_code == 1
+    assert "were not found" in result.output
     assert (project / "board.kicad_sch").read_text() == '(lib_id "OLD:ADC1")\n'

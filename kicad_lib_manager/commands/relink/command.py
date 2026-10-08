@@ -47,8 +47,11 @@ class LibraryIndex:
     footprints: dict[str, set[str]] = field(default_factory=dict)
     managed_symbol_libs: dict[str, set[str]] = field(default_factory=dict)
     managed_footprint_libs: dict[str, set[str]] = field(default_factory=dict)
-    # nickname -> file/dir of each managed library, to recognise table entries
-    managed_paths: dict[str, Path] = field(default_factory=dict)
+    # nickname -> .kicad_sym / .pretty path of each managed library, per kind,
+    # to recognise project table entries (a symbol and a footprint library
+    # may share a nickname)
+    managed_symbol_paths: dict[str, Path] = field(default_factory=dict)
+    managed_footprint_paths: dict[str, Path] = field(default_factory=dict)
     # 3D model file name -> "${ENV_VAR}" prefix of the 3D library holding it
     models: dict[str, str] = field(default_factory=dict)
 
@@ -73,13 +76,13 @@ def build_index(lib_paths: list[Path], model_dirs: dict[str, Path]) -> LibraryIn
             text = sym_file.read_text(encoding="utf-8")
             names = {symbol_name(b) for b in extract_symbol_blocks(text)}
             index.managed_symbol_libs[sym_file.stem] = names
-            index.managed_paths[sym_file.stem] = sym_file.resolve()
+            index.managed_symbol_paths[sym_file.stem] = sym_file.resolve()
             for name in names:
                 index.symbols.setdefault(name, set()).add(sym_file.stem)
         for fp_dir in sorted((lib_path / "footprints").glob("*.pretty")):
             names = {f.stem for f in fp_dir.glob("*.kicad_mod")}
             index.managed_footprint_libs[fp_dir.stem] = names
-            index.managed_paths[fp_dir.stem] = fp_dir.resolve()
+            index.managed_footprint_paths[fp_dir.stem] = fp_dir.resolve()
             for name in names:
                 index.footprints.setdefault(name, set()).add(fp_dir.stem)
     for env_var, model_dir in sorted(model_dirs.items()):
@@ -103,6 +106,10 @@ def _relink_refs(
     known_nicknames: set[str],
     shadowed: set[str],
 ) -> None:
+    # Cached symbol names present now or created by this pass, so two broken
+    # cache entries for the same part are not both renamed to one name.
+    cached = set(re.findall(r'\(symbol "([^"]+:[^"]+)"', result.text))
+
     def _replace(m: re.Match[str]) -> str:
         nick, item = m.group(2), m.group(3)
         if nick in managed and nick not in shadowed:
@@ -119,10 +126,12 @@ def _relink_refs(
             result.unresolved.append(f"{kind} {nick}:{item} ({reason})")
             return m.group(0)
         new_ref = f"{candidates[0]}:{item}"
-        if m.group(1) == '(symbol "' and f'(symbol "{new_ref}"' in result.text:
-            # The schematic already caches the target symbol; renaming this
-            # cache entry would duplicate it. KiCad drops the orphan on save.
-            return m.group(0)
+        if m.group(1) == '(symbol "':
+            if new_ref in cached:
+                # The target symbol is already cached; renaming this entry
+                # would duplicate it. KiCad drops the orphan on save.
+                return m.group(0)
+            cached.add(new_ref)
         result.changes.append(f"{kind} {nick}:{item} -> {new_ref}")
         return f'{m.group(1)}{new_ref}"'
 
@@ -156,16 +165,17 @@ def relink_text(
     known_sym: set[str],
     known_fp: set[str],
     env: dict[str, str],
-    shadowed: Optional[set[str]] = None,
+    shadowed_sym: Optional[set[str]] = None,
+    shadowed_fp: Optional[set[str]] = None,
 ) -> RelinkResult:
     """Rewrite broken references in the text of a .kicad_sch or .kicad_pcb file.
 
     known_sym / known_fp are the nicknames configured in KiCad (global and
-    project tables). shadowed are managed nicknames that a project table
-    redefines to point elsewhere; they are treated as foreign libraries.
+    project tables). shadowed_sym / shadowed_fp are managed nicknames that the
+    project's symbol / footprint table redefines to point elsewhere; they are
+    treated as foreign libraries.
     env resolves ${VAR} in 3D model paths (KIPRJMOD for relative ones).
     """
-    shadowed = shadowed or set()
     result = RelinkResult(text)
     _relink_refs(
         result,
@@ -174,7 +184,7 @@ def relink_text(
         index.symbols,
         index.managed_symbol_libs,
         known_sym,
-        shadowed,
+        shadowed_sym or set(),
     )
     _relink_refs(
         result,
@@ -183,7 +193,7 @@ def relink_text(
         index.footprints,
         index.managed_footprint_libs,
         known_fp,
-        shadowed,
+        shadowed_fp or set(),
     )
 
     def _replace_model(m: re.Match[str]) -> str:
@@ -203,11 +213,54 @@ def relink_text(
     return result
 
 
+# Library dirs of a KiCad installation, by the suffix of the KICADn_* variable
+# KiCad defines for them at runtime (they are not stored in kicad_common.json).
+_INSTALL_SUBDIRS = {
+    "SYMBOL_DIR": "symbols",
+    "FOOTPRINT_DIR": "footprints",
+    "3DMODEL_DIR": "3dmodels",
+    "TEMPLATE_DIR": "template",
+}
+_INSTALL_SHARE_DIRS = (
+    "/usr/share/kicad",
+    "/usr/local/share/kicad",
+    "/app/share/kicad",
+    "/Applications/KiCad/KiCad.app/Contents/SharedSupport",
+)
+_KICAD_VERSIONS = range(5, 12)
+
+
+def _kicad_install_vars() -> dict[str, str]:
+    """Best-effort values for KiCad's built-in KICADn_*_DIR variables."""
+    shares = [Path(d) for d in _INSTALL_SHARE_DIRS]
+    shares += [
+        Path(f"C:/Program Files/KiCad/{v}.0/share/kicad") for v in _KICAD_VERSIONS
+    ]
+    share = next((d for d in shares if d.is_dir()), None)
+    if share is None:
+        return {}
+    install_vars: dict[str, str] = {}
+    for suffix, subdir in _INSTALL_SUBDIRS.items():
+        path = (share / subdir).as_posix()
+        install_vars[f"KICAD_{suffix}"] = path
+        for version in _KICAD_VERSIONS:
+            install_vars[f"KICAD{version}_{suffix}"] = path
+    return install_vars
+
+
 def _table_entries(
-    table: Path, env: dict[str, str], seen: frozenset[Path] = frozenset()
+    table: Path,
+    env: dict[str, str],
+    seen: frozenset[Path] = frozenset(),
+    missing: Optional[list[str]] = None,
 ) -> dict[str, str]:
-    """Nickname -> expanded uri of a lib table, following nested "Table" entries."""
+    """Nickname -> expanded uri of a lib table, following nested "Table" entries.
+
+    Nested tables that cannot be found are appended to missing.
+    """
     if not table.is_file() or table in seen:
+        if seen and missing is not None and table not in seen:
+            missing.append(table.as_posix())
         return {}
     entries: dict[str, str] = {}
     for chunk in table.read_text(encoding="utf-8").split("(lib ")[1:]:
@@ -219,25 +272,29 @@ def _table_entries(
         if not name:
             continue
         if fields.get("type", "").lower() == "table":
-            entries.update(_table_entries(Path(uri), env, seen | {table}))
+            entries.update(_table_entries(Path(uri), env, seen | {table}, missing))
         else:
             entries[name] = uri
     return entries
 
 
-def _table_nicknames(
-    table: Path, env: dict[str, str], seen: frozenset[Path] = frozenset()
+def _shadowed(
+    entries: dict[str, str], managed_paths: dict[str, Path], project_dir: Path
 ) -> set[str]:
-    """Nicknames in a lib table, following nested (type "Table") entries."""
-    return set(_table_entries(table, env, seen))
+    """Managed nicknames that a project table points at a different library.
 
-
-def _shadowed(entries: dict[str, str], index: LibraryIndex) -> set[str]:
-    """Managed nicknames that a project table points at a different library."""
+    An entry whose uri cannot be resolved (unknown ${VAR}) counts as
+    shadowing: its references are left alone rather than guessed at.
+    """
     shadowed: set[str] = set()
     for name, uri in entries.items():
-        managed = index.managed_paths.get(name)
-        if managed is not None and Path(uri).resolve() != managed:
+        managed = managed_paths.get(name)
+        if managed is None:
+            continue
+        target = Path(uri)
+        if not target.is_absolute():
+            target = project_dir / target
+        if "${" in uri or target.resolve() != managed:
             shadowed.add(name)
     return shadowed
 
@@ -291,13 +348,27 @@ def relink(
             model_dirs[env_var] = Path(lib["path"])
 
     kicad_config = KiCadService.find_kicad_config_dir()
-    env = {**os.environ, **KiCadService().get_environment_variables(kicad_config)}
-    global_sym = _table_nicknames(kicad_config / "sym-lib-table", env)
-    global_fp = _table_nicknames(kicad_config / "fp-lib-table", env)
+    env = {
+        **_kicad_install_vars(),
+        **os.environ,
+        **KiCadService().get_environment_variables(kicad_config),
+    }
+    missing: list[str] = []
+    global_sym = set(
+        _table_entries(kicad_config / "sym-lib-table", env, missing=missing)
+    )
+    global_fp = set(_table_entries(kicad_config / "fp-lib-table", env, missing=missing))
+    # Without the full global tables, references would look broken that are not.
     if not global_sym or not global_fp:
-        # Without the global tables every reference would look broken.
         console.print(
             f"[red]Could not read KiCad's global library tables in {kicad_config}[/red]"
+        )
+        raise typer.Exit(1)
+    if missing:
+        console.print(
+            "[red]KiCad's global library tables include tables that were not found: "
+            f"{', '.join(missing)}[/red]\n"
+            "[red]Define the variables they use in the environment and retry.[/red]"
         )
         raise typer.Exit(1)
 
@@ -323,7 +394,8 @@ def relink(
             global_sym | set(project_sym),
             global_fp | set(project_fp),
             project_env,
-            _shadowed({**project_sym, **project_fp}, index),
+            _shadowed(project_sym, index.managed_symbol_paths, project_dir),
+            _shadowed(project_fp, index.managed_footprint_paths, project_dir),
         )
         if not result.changes and not result.unresolved:
             continue
