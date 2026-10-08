@@ -14,7 +14,7 @@ import typer
 from rich.console import Console
 
 from ...services.config_service import Config, LibraryDict
-from ...utils.metadata import read_cloud_metadata
+from ...utils.metadata import read_cloud_metadata, read_github_metadata
 
 console = Console()
 
@@ -64,10 +64,22 @@ def _symbol_name(block: str) -> str:
     return m.group(1) if m else ""
 
 
-def _fix_footprint_ref(block: str, lib_name: str) -> str:
+def _fix_footprint_ref(
+    block: str, lib_name: str, fp_libs: Optional[dict[str, str]] = None
+) -> str:
+    """Point the symbol's Footprint field at a library.
+
+    fp_libs maps footprint names from the same ZIP to the library that holds
+    them; those win over any vendor prefix. Other bare names get lib_name;
+    other prefixed names are left alone.
+    """
+
     def _replace(m: re.Match[str]) -> str:
         val = m.group(1)
-        if ":" not in val:
+        name = val.split(":", 1)[1] if ":" in val else val
+        if fp_libs and name in fp_libs:
+            val = f"{fp_libs[name]}:{name}"
+        elif ":" not in val:
             val = f"{lib_name}:{val}"
         return f'"Footprint" "{val}"'
 
@@ -75,7 +87,11 @@ def _fix_footprint_ref(block: str, lib_name: str) -> str:
 
 
 def _merge_symbols(
-    src_file: Path, sym_lib: Path, lib_name: str, dry_run: bool
+    src_file: Path,
+    sym_lib: Path,
+    lib_name: str,
+    dry_run: bool,
+    fp_libs: Optional[dict[str, str]] = None,
 ) -> tuple[list[str], list[str]]:
     src_text = src_file.read_text(encoding="utf-8")
     dest_text = sym_lib.read_text(encoding="utf-8")
@@ -90,7 +106,7 @@ def _merge_symbols(
         if name in existing:
             skipped.append(name)
             continue
-        block = _fix_footprint_ref(block, lib_name)
+        block = _fix_footprint_ref(block, lib_name, fp_libs)
         new_blocks.append(block)
         added.append(name)
 
@@ -255,8 +271,10 @@ def _import_zip(
                     result["models"].append(f.name)
 
         # Footprints
+        fp_libs: dict[str, str] = {}
         for f in tmp_path.rglob("*.kicad_mod"):
             dest = fp_dir / f.name
+            fp_libs[f.stem] = fp_dir.stem
             if dest.exists():
                 console.print(f"  FP   skip (exists): {f.name}")
                 continue
@@ -273,7 +291,7 @@ def _import_zip(
         for f in tmp_path.rglob("*.kicad_sym"):
             if not dry_run:
                 _upgrade_sym(f, kicad_cli)
-            added, skipped = _merge_symbols(f, sym_lib, fp_dir.stem, dry_run)
+            added, skipped = _merge_symbols(f, sym_lib, fp_dir.stem, dry_run, fp_libs)
             for name in added:
                 console.print(f"  SYM  add: {name}")
             for name in skipped:
@@ -325,13 +343,15 @@ def _pick_lib(
 
 
 def _resolve_models(
-    lib_path: Path, lib_name: str, cloud_libs: list[LibraryDict]
+    lib_path: Path, default_name: str, cloud_libs: list[LibraryDict]
 ) -> tuple[Path, str]:
-    """Return (models dir, model path prefix).
+    """Return (models dir, model path prefix) for the whole library.
 
     A 3D library registered with 'kilm add-3d' inside lib_path is used via its
-    environment variable; otherwise fall back to <lib_name>.3dshapes under
-    ${KICAD_3RD_PARTY}.
+    environment variable. Otherwise models go into the library's existing
+    *.3dshapes dir (or <default_name>.3dshapes), referenced through the
+    library's own environment variable from kilm.yaml, which 'kilm setup'
+    defines in KiCad; without one, the absolute path is used.
     """
     for lib in cloud_libs:
         models_dir = Path(lib["path"])
@@ -341,10 +361,12 @@ def _resolve_models(
         env_var = metadata.get("env_var")
         if isinstance(env_var, str) and env_var:
             return models_dir, f"${{{env_var}}}"
-    return (
-        lib_path / f"{lib_name}.3dshapes",
-        f"${{KICAD_3RD_PARTY}}/{lib_name}.3dshapes",
-    )
+    existing = sorted(d for d in lib_path.glob("*.3dshapes") if d.is_dir())
+    models_dir = existing[0] if existing else lib_path / f"{default_name}.3dshapes"
+    lib_env_var = (read_github_metadata(lib_path) or {}).get("env_var")
+    if isinstance(lib_env_var, str) and lib_env_var:
+        return models_dir, f"${{{lib_env_var}}}/{models_dir.name}"
+    return models_dir, models_dir.resolve().as_posix()
 
 
 def import_zip(
@@ -445,7 +467,7 @@ def import_zip(
     sym_lib = _pick_lib(sym_candidates, symbol_lib, "symbol", "--symbol-lib")
     fp_dir = _pick_lib(fp_candidates, footprint_lib, "footprint", "--footprint-lib")
     models_dir, model_prefix = _resolve_models(
-        lib_path, sym_lib.stem, config.get_libraries(library_type="cloud")
+        lib_path, sym_candidates[0].stem, config.get_libraries(library_type="cloud")
     )
     console.print(f"[dim]Target: {sym_lib.stem} / {fp_dir.stem} / {model_prefix}[/dim]")
 

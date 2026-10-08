@@ -458,3 +458,76 @@ def test_import_zip_rejects_missing_kicad_cli_path(
     assert (
         "CliPart" not in (library_tree / "symbols" / "SAMPLELIB.kicad_sym").read_text()
     )
+
+
+def _zip_with(tmp_path: Path, name: str, files: dict[str, str]) -> Path:
+    zip_path = tmp_path / f"{name}.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for member, content in files.items():
+            zf.writestr(member, content)
+    return zip_path
+
+
+def test_vendor_footprint_prefix_is_replaced_for_imported_footprint(
+    tmp_path: Path, category_tree: Path
+):
+    zip_path = _zip_with(
+        tmp_path,
+        "VendChip",
+        {
+            "VendChip/KiCad/VendChip.kicad_sym": (
+                '(kicad_symbol_lib\n\t(symbol "VendChip"\n'
+                '\t\t(property "Footprint" "SamacSys_Parts:VENDFP")\n\t)\n)\n'
+            ),
+            "VendChip/KiCad/VENDFP.kicad_mod": '(footprint "VENDFP")\n',
+        },
+    )
+
+    result = _run_import("-s", "CAT_IC", "-f", "CAT_QFN", str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    text = (category_tree / "symbols" / "CAT_IC.kicad_sym").read_text()
+    assert '"Footprint" "CAT_QFN:VENDFP"' in text
+
+
+def test_fallback_models_use_library_env_var(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    (library_tree / "kilm.yaml").write_text(
+        "name: mylib\nenv_var: KICAD_LIB_MYLIB\n", encoding="utf-8"
+    )
+    zip_path = _zip_with(
+        tmp_path,
+        "M1",
+        {
+            "M1/KiCad/M1.kicad_sym": '(kicad_symbol_lib\n\t(symbol "M1"\n\t)\n)\n',
+            "M1/KiCad/M1.kicad_mod": '(footprint "M1"\n\t(model "C:/x/M1.stp"\n\t)\n)\n',
+            "M1/3D/M1.stp": "STEP",
+        },
+    )
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    fp = (library_tree / "footprints" / "SAMPLELIB.pretty" / "M1.kicad_mod").read_text()
+    assert '(model "${KICAD_LIB_MYLIB}/SAMPLELIB.3dshapes/M1.stp"' in fp
+
+
+def test_fallback_models_without_env_var_use_absolute_path(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    zip_path = _zip_with(
+        tmp_path,
+        "M2",
+        {
+            "M2/KiCad/M2.kicad_mod": '(footprint "M2"\n\t(model "M2.stp"\n\t)\n)\n',
+            "M2/3D/M2.stp": "STEP",
+        },
+    )
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    fp = (library_tree / "footprints" / "SAMPLELIB.pretty" / "M2.kicad_mod").read_text()
+    assert "KICAD_3RD_PARTY" not in fp
+    assert (library_tree / "SAMPLELIB.3dshapes").resolve().as_posix() in fp
