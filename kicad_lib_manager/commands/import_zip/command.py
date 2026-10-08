@@ -450,6 +450,9 @@ def import_zip(
     console.print(f"[dim]Target: {sym_lib.stem} / {fp_dir.stem} / {model_prefix}[/dim]")
 
     # Resolve kicad-cli
+    if kicad_cli_path is not None and not kicad_cli_path.exists():
+        console.print(f"[red]kicad-cli not found at: {kicad_cli_path}[/red]")
+        raise typer.Exit(1)
     kicad_cli = kicad_cli_path if kicad_cli_path else _detect_kicad_cli()
     if kicad_cli:
         console.print(f"[dim]kicad-cli: {kicad_cli}[/dim]")

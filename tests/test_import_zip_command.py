@@ -441,3 +441,20 @@ def test_import_zip_into_category_libs(tmp_path: Path, category_tree: Path):
     assert '(model "${KICAD_3D_CAT_MODELS}/CatPart.stp"' in fp.read_text()
     assert (category_tree / "CAT.3dshapes" / "CatPart.stp").exists()
     assert not (category_tree / "CAT_IC.3dshapes").exists()
+
+
+def test_import_zip_rejects_missing_kicad_cli_path(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    zip_path = _make_samacsys_zip(tmp_path, "CliPart")
+
+    result = runner.invoke(
+        app,
+        ["import", "--kicad-cli", str(tmp_path / "nope" / "kicad-cli"), str(zip_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "kicad-cli not found at:" in result.output
+    assert (
+        "CliPart" not in (library_tree / "symbols" / "SAMPLELIB.kicad_sym").read_text()
+    )
