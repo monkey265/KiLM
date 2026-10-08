@@ -885,8 +885,15 @@ def test_fix_3d_path_handles_windows_separators():
 
 
 def test_model_name_differing_only_in_case_is_not_overwritten(
-    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+    tmp_path: Path,
+    library_tree: Path,
+    mock_config: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    # Windows/macOS: "SOT23.step" is the existing "SOT23.STEP".
+    monkeypatch.setattr(
+        "kicad_lib_manager.commands.import_zip.command._CASE_INSENSITIVE_FS", True
+    )
     models = library_tree / "SAMPLELIB.3dshapes"
     models.mkdir()
     (models / "SOT23.STEP").write_text("ORIGINAL")
@@ -940,3 +947,67 @@ def test_merge_symbols_adds_repeated_name_once(tmp_path: Path):
     assert added == ["Twice"]
     assert skipped == ["Twice"]
     assert sym_lib.read_text().count('(symbol "Twice"') == 1
+
+
+def test_case_distinct_models_stay_separate_on_linux(
+    tmp_path: Path,
+    library_tree: Path,
+    mock_config: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "kicad_lib_manager.commands.import_zip.command._CASE_INSENSITIVE_FS", False
+    )
+    models = library_tree / "SAMPLELIB.3dshapes"
+    models.mkdir()
+    (models / "qfn-16.step").write_text("OTHER PART")
+    zip_path = _zip_with(
+        tmp_path,
+        "Lin",
+        {
+            "L/KiCad/LFP.kicad_mod": '(footprint "LFP"\n\t(model "x/QFN-16.step"\n\t)\n)\n',
+            "L/3D/QFN-16.step": "VENDOR",
+        },
+    )
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert "3D   add: QFN-16.step" in result.output
+    assert (models / "qfn-16.step").read_text() == "OTHER PART"
+    fp = (
+        library_tree / "footprints" / "SAMPLELIB.pretty" / "LFP.kicad_mod"
+    ).read_text()
+    assert "/SAMPLELIB.3dshapes/QFN-16.step" in fp
+
+
+def test_same_dir_model_in_other_case_is_skipped_not_reused(
+    tmp_path: Path,
+    library_tree: Path,
+    mock_config: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "kicad_lib_manager.commands.import_zip.command._CASE_INSENSITIVE_FS", True
+    )
+    models = library_tree / "SAMPLELIB.3dshapes"
+    models.mkdir()
+    (models / "SOT23.STEP").write_text("ORIGINAL")
+    zip_path = _zip_with(tmp_path, "Same", {"S/3D/SOT23.step": "VENDOR"})
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert "3D   skip (exists): SOT23.step" in result.output
+
+
+def test_merge_symbols_with_empty_known_set_does_not_read_library(tmp_path: Path):
+    sym_lib = tmp_path / "SAMPLELIB.kicad_sym"
+    sym_lib.write_text(SAMPLE_SYM_LIB, encoding="utf-8")
+    src = tmp_path / "src.kicad_sym"
+    src.write_text('(kicad_symbol_lib\n\t(symbol "ExistingPart"\n\t)\n)\n')
+
+    added, _ = _merge_symbols(src, sym_lib, "SAMPLELIB", dry_run=True, elsewhere=set())
+
+    # An explicitly empty set means "nothing known", not "read sym_lib".
+    assert added == ["ExistingPart"]

@@ -30,7 +30,14 @@ _INSTALL_SUBDIRS = {
     "3DMODEL_DIR": "3dmodels",
     "TEMPLATE_DIR": "template",
 }
-_OLDEST_VERSION = 5
+# KiCad 6 introduced versioned names; KiCad 5 used these instead.
+_KICAD5_VARS = {
+    "KICAD_SYMBOL_DIR": "symbols",
+    "KISYSMOD": "footprints",
+    "KISYS3DMOD": "3dmodels",
+    "KICAD_TEMPLATE_DIR": "template",
+}
+_OLDEST_VERSION = 6
 
 
 def detect_kicad_cli() -> Optional[Path]:
@@ -69,6 +76,10 @@ def kicad_share_dir(kicad_cli: Path) -> Optional[Path]:
 
 
 def kicad_major_version(kicad_cli: Path) -> Optional[int]:
+    """Major version whose variable names the installation uses.
+
+    Development builds (x.99) already use the next major's names.
+    """
     try:
         out = subprocess.run(
             build_kicad_cli_cmd(kicad_cli, "version"),
@@ -79,27 +90,35 @@ def kicad_major_version(kicad_cli: Path) -> Optional[int]:
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    m = re.match(r"\s*(\d+)\.", out)
-    return int(m.group(1)) if m else None
+    m = re.match(r"\s*(\d+)\.(\d+)", out)
+    if not m:
+        return None
+    major, minor = int(m.group(1)), int(m.group(2))
+    return major + 1 if minor >= 99 else major
 
 
 def kicad_install_vars(kicad_cli: Optional[Path] = None) -> dict[str, str]:
     """Values for KiCad's built-in KICADn_*_DIR variables, from the installation.
 
-    Covers the installed major version and older ones (configs migrated from
-    earlier versions keep their variable names). Empty if KiCad is not found.
+    Covers the installed major version and older ones, including KiCad 5's
+    names (configs migrated from earlier versions keep their variable names).
+    Empty if KiCad or its share dir is not found.
     """
     kicad_cli = kicad_cli or detect_kicad_cli()
     if kicad_cli is None:
         return {}
     share = kicad_share_dir(kicad_cli)
-    version = kicad_major_version(kicad_cli)
-    if share is None or version is None:
+    if share is None:
+        # Not worth launching kicad-cli (slow for AppImages) for nothing.
         return {}
-    install_vars: dict[str, str] = {}
+    version = kicad_major_version(kicad_cli)
+    if version is None:
+        return {}
+    install_vars = {
+        name: (share / subdir).as_posix() for name, subdir in _KICAD5_VARS.items()
+    }
     for suffix, subdir in _INSTALL_SUBDIRS.items():
         path = (share / subdir).as_posix()
-        install_vars[f"KICAD_{suffix}"] = path
         for v in range(_OLDEST_VERSION, version + 1):
             install_vars[f"KICAD{v}_{suffix}"] = path
     return install_vars

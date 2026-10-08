@@ -161,10 +161,11 @@ def _expand(path: str, env: dict[str, str]) -> str:
 
 def _model_resolves(path: str, env: dict[str, str]) -> bool:
     for var in _VAR_RE.findall(path):
-        if _BUILTIN_VAR_RE.match(var):
-            return True
-        if var not in env:
-            return False
+        if var in env:
+            continue
+        # KiCad's own variables are defined by the installation; without a
+        # known value, assume the path resolves rather than rewrite it.
+        return bool(_BUILTIN_VAR_RE.match(var))
     resolved = Path(_expand(path, env))
     if not resolved.is_absolute() and "KIPRJMOD" in env:
         resolved = Path(env["KIPRJMOD"]) / resolved

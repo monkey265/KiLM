@@ -435,3 +435,14 @@ def test_nested_table_resolved_via_kicad_install(
     assert (project / "board.kicad_sch").read_text() == (
         '(lib_id "Device:R")\n(lib_id "CAT_IC:ADC1")\n'
     )
+
+
+def test_missing_model_in_known_kicad_dir_is_reported(index, tmp_path: Path):
+    text = '(model "${KICAD9_3DMODEL_DIR}/Package_SO.3dshapes/Gone.step"'
+
+    r = _relink(text, index, {"KICAD9_3DMODEL_DIR": str(tmp_path)})
+
+    assert r.text == text
+    assert r.unresolved == [
+        "3D model ${KICAD9_3DMODEL_DIR}/Package_SO.3dshapes/Gone.step (not found)"
+    ]

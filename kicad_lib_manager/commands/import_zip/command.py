@@ -5,6 +5,7 @@ Import command: unpack a SamacSys/Mouser/UltraLibrarian/SnapMagic KiCad ZIP into
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 from collections.abc import Mapping, Set
@@ -54,20 +55,22 @@ def _merge_symbols(
     sym_lib: Path,
     lib_name: str,
     dry_run: bool,
-    elsewhere: Set[str] = frozenset(),
+    elsewhere: Optional[Set[str]] = None,
     fp_libs: Optional[dict[str, str]] = None,
 ) -> tuple[list[str], list[str]]:
     """Append new symbols to sym_lib, skipping names already known.
 
-    elsewhere, when given, is every symbol name already in the library
-    (sym_lib included); otherwise sym_lib itself is read. A name repeated
-    within src_file is added once.
+    elsewhere, when given (even empty), is every symbol name already in the
+    library, sym_lib included; when None, sym_lib itself is read. A name
+    repeated within src_file is added once.
     """
     src_text = src_file.read_text(encoding="utf-8")
     dest_text = sym_lib.read_text(encoding="utf-8")
-    known: Set[str] = elsewhere or {
-        symbol_name(b) for b in extract_symbol_blocks(dest_text)
-    }
+    known: Set[str] = (
+        elsewhere
+        if elsewhere is not None
+        else {symbol_name(b) for b in extract_symbol_blocks(dest_text)}
+    )
 
     added: list[str] = []
     skipped: list[str] = []
@@ -92,6 +95,16 @@ def _merge_symbols(
     return added, skipped
 
 
+# Windows and macOS filesystems ignore case by default, so "X.STEP" and
+# "X.step" are one file there and must be matched as one; on Linux they are
+# different files.
+_CASE_INSENSITIVE_FS = sys.platform in ("win32", "darwin")
+
+
+def _model_key(name: str) -> str:
+    return name.lower() if _CASE_INSENSITIVE_FS else name
+
+
 # ── Footprint helpers ─────────────────────────────────────────────────────────
 
 
@@ -108,14 +121,14 @@ def _fix_3d_path(
 ) -> str:
     """Point every model path at model_prefix, e.g. "${KICAD_3D_MYLIB}".
 
-    known maps lower-cased model file names to the path of a model already in
-    the library; those win over model_prefix.
+    known maps model file names (see _model_key) to the path of a model
+    already in the library; those win over model_prefix.
     """
 
     def _replace(m: re.Match[str]) -> str:
         raw = m.group(1) if m.group(1) is not None else m.group(2)
         filename = Path(raw.replace("\\", "/")).name
-        path = (known or {}).get(filename.lower(), f"{model_prefix}/{filename}")
+        path = (known or {}).get(_model_key(filename), f"{model_prefix}/{filename}")
         return f'(model "{path}"'
 
     return _MODEL_PATH_RE.sub(_replace, text)
@@ -222,7 +235,7 @@ class _RunState:
     known_symbols: set[str]
     # footprint name -> library holding it, for footprints added this run
     footprints: dict[str, str] = field(default_factory=dict)
-    # lower-cased model file name -> model path (existing + added this run)
+    # model file name (see _model_key) -> model path (existing + added this run)
     models: dict[str, str] = field(default_factory=dict)
 
 
@@ -266,8 +279,10 @@ def _import_zip(
             if f.suffix.lower() in (".stp", ".step") or f.name.lower().endswith(
                 (".stp.gz", ".step.gz")
             ):
-                existing = state.models.get(f.name.lower())
-                if existing == f"{model_prefix}/{f.name}":
+                existing = state.models.get(_model_key(f.name))
+                if existing is not None and _model_key(existing) == _model_key(
+                    f"{model_prefix}/{f.name}"
+                ):
                     console.print(f"  3D   skip (exists): {f.name}")
                     continue
                 if existing is not None:
@@ -279,7 +294,7 @@ def _import_zip(
                 if not dry_run:
                     models_dir.mkdir(exist_ok=True)
                     shutil.copy2(f, models_dir / f.name)
-                state.models[f.name.lower()] = f"{model_prefix}/{f.name}"
+                state.models[_model_key(f.name)] = f"{model_prefix}/{f.name}"
                 result["models"].append(f.name)
 
         # Footprints
@@ -328,12 +343,10 @@ def _import_zip(
 def _existing_models(
     lib_path: Path, models_dir: Path, model_prefix: str, lib_env_var: object
 ) -> dict[str, str]:
-    """Lower-cased model file name -> model path, for models already in the library.
+    """Model file name (see _model_key) -> model path, for models in the library.
 
     Covers the target models dir and every other *.3dshapes dir of the
-    library, so an import reuses a model wherever it already lives. Names are
-    matched case-insensitively: on Windows and macOS "X.STEP" and "X.step"
-    are the same file.
+    library, so an import reuses a model wherever it already lives.
     """
     dirs = [(models_dir, model_prefix)]
     for d in sorted(lib_path.glob("*.3dshapes")):
@@ -344,7 +357,7 @@ def _existing_models(
         if d.is_dir():
             for f in sorted(d.iterdir()):
                 if f.is_file() and not f.name.startswith("."):
-                    models.setdefault(f.name.lower(), f"{prefix}/{f.name}")
+                    models.setdefault(_model_key(f.name), f"{prefix}/{f.name}")
     return models
 
 

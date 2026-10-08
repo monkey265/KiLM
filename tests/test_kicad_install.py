@@ -51,3 +51,42 @@ def test_install_vars_empty_without_kicad(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(kicad_install, "detect_kicad_cli", lambda: None)
 
     assert kicad_install.kicad_install_vars() == {}
+
+
+def test_install_vars_include_kicad5_names_and_skip_kicad5_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cli = _fake_install(tmp_path, "usr/bin/kicad-cli", "usr/share/kicad")
+    monkeypatch.setattr(kicad_install, "kicad_major_version", lambda _: 9)
+
+    install_vars = kicad_install.kicad_install_vars(cli)
+
+    assert install_vars["KISYSMOD"].endswith("/footprints")
+    assert install_vars["KISYS3DMOD"].endswith("/3dmodels")
+    assert "KICAD5_TEMPLATE_DIR" not in install_vars
+
+
+@pytest.mark.parametrize(("out", "major"), [("9.0.3\n", 9), ("9.99.0-123\n", 10)])
+def test_major_version_maps_dev_builds_to_next_major(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: str, major: int
+):
+    class _Done:
+        stdout = out
+
+    monkeypatch.setattr(kicad_install.subprocess, "run", lambda *a, **k: _Done())
+
+    assert kicad_install.kicad_major_version(tmp_path / "kicad-cli") == major
+
+
+def test_no_version_probe_without_share_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cli = tmp_path / "kicad.appimage"
+    cli.write_text("")
+
+    def _fail(_: Path) -> int:
+        raise AssertionError("kicad-cli should not be launched")
+
+    monkeypatch.setattr(kicad_install, "kicad_major_version", _fail)
+
+    assert kicad_install.kicad_install_vars(cli) == {}
