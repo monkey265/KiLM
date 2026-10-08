@@ -531,3 +531,37 @@ def test_fallback_models_without_env_var_use_absolute_path(
     fp = (library_tree / "footprints" / "SAMPLELIB.pretty" / "M2.kicad_mod").read_text()
     assert "KICAD_3RD_PARTY" not in fp
     assert (library_tree / "SAMPLELIB.3dshapes").resolve().as_posix() in fp
+
+
+def test_split_library_fallback_models_dir_named_after_library(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    (library_tree / "symbols" / "OTHER.kicad_sym").write_text(SAMPLE_SYM_LIB)
+    zip_path = _zip_with(
+        tmp_path,
+        "M3",
+        {
+            "M3/KiCad/M3.kicad_mod": '(footprint "M3"\n\t(model "M3.stp"\n\t)\n)\n',
+            "M3/3D/M3.stp": "STEP",
+        },
+    )
+
+    result = _run_import("-s", "SAMPLELIB", str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert (library_tree / f"{library_tree.name}.3dshapes" / "M3.stp").exists()
+    assert "3D model paths will be absolute to this machine" in result.output
+
+
+def test_models_dir_prefers_library_named_dir(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    (library_tree / "AAA.3dshapes").mkdir()
+    (library_tree / "SAMPLELIB.3dshapes").mkdir()
+    zip_path = _zip_with(tmp_path, "M4", {"M4/3D/M4.stp": "STEP"})
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert (library_tree / "SAMPLELIB.3dshapes" / "M4.stp").exists()
+    assert not (library_tree / "AAA.3dshapes" / "M4.stp").exists()

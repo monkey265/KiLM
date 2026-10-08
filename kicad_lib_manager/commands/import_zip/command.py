@@ -349,7 +349,8 @@ def _resolve_models(
 
     A 3D library registered with 'kilm add-3d' inside lib_path is used via its
     environment variable. Otherwise models go into the library's existing
-    *.3dshapes dir (or <default_name>.3dshapes), referenced through the
+    *.3dshapes dir (one named after the library, or the only one; else
+    <default_name>.3dshapes), referenced through the
     library's own environment variable from kilm.yaml, which 'kilm setup'
     defines in KiCad; without one, the absolute path is used.
     """
@@ -361,9 +362,22 @@ def _resolve_models(
         env_var = metadata.get("env_var")
         if isinstance(env_var, str) and env_var:
             return models_dir, f"${{{env_var}}}"
+    metadata = read_github_metadata(lib_path) or {}
     existing = sorted(d for d in lib_path.glob("*.3dshapes") if d.is_dir())
-    models_dir = existing[0] if existing else lib_path / f"{default_name}.3dshapes"
-    lib_env_var = (read_github_metadata(lib_path) or {}).get("env_var")
+    preferred = {default_name, str(metadata.get("name", "")), lib_path.name}
+    named = [d for d in existing if d.stem in preferred]
+    if named:
+        models_dir = named[0]
+    elif len(existing) == 1:
+        models_dir = existing[0]
+    else:
+        if existing:
+            console.print(
+                f"[yellow]Several *.3dshapes dirs in {lib_path}; register the right "
+                f"one with 'kilm add-3d'. Using {default_name}.3dshapes[/yellow]"
+            )
+        models_dir = lib_path / f"{default_name}.3dshapes"
+    lib_env_var = metadata.get("env_var")
     if isinstance(lib_env_var, str) and lib_env_var:
         return models_dir, f"${{{lib_env_var}}}/{models_dir.name}"
     return models_dir, models_dir.resolve().as_posix()
@@ -466,9 +480,18 @@ def import_zip(
 
     sym_lib = _pick_lib(sym_candidates, symbol_lib, "symbol", "--symbol-lib")
     fp_dir = _pick_lib(fp_candidates, footprint_lib, "footprint", "--footprint-lib")
-    models_dir, model_prefix = _resolve_models(
-        lib_path, sym_candidates[0].stem, config.get_libraries(library_type="cloud")
+    default_models_name = (
+        sym_candidates[0].stem if len(sym_candidates) == 1 else lib_path.name
     )
+    models_dir, model_prefix = _resolve_models(
+        lib_path, default_models_name, config.get_libraries(library_type="cloud")
+    )
+    if not model_prefix.startswith("${"):
+        console.print(
+            "[yellow]3D model paths will be absolute to this machine. Set env_var "
+            "in kilm.yaml (kilm init) or register a 3D library (kilm add-3d) to "
+            "share the library.[/yellow]"
+        )
     console.print(f"[dim]Target: {sym_lib.stem} / {fp_dir.stem} / {model_prefix}[/dim]")
 
     # Resolve kicad-cli
