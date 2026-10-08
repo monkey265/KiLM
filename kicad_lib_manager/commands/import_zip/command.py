@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -131,13 +132,20 @@ _MODEL_PATH_RE = re.compile(
 )
 
 
-def _fix_3d_path(text: str, model_prefix: str) -> str:
-    """Point every model path at model_prefix, e.g. "${KICAD_3D_MYLIB}"."""
+def _fix_3d_path(
+    text: str, model_prefix: str, prefixes: Optional[Mapping[str, str]] = None
+) -> str:
+    """Point every model path at model_prefix, e.g. "${KICAD_3D_MYLIB}".
+
+    prefixes maps model file names to the prefix of the dir that already
+    holds them; those win over model_prefix.
+    """
 
     def _replace(m: re.Match[str]) -> str:
         raw = m.group(1) if m.group(1) is not None else m.group(2)
-        filename = Path(raw).name
-        return f'(model "{model_prefix}/{filename}"'
+        filename = Path(raw.replace("\\", "/")).name
+        prefix = (prefixes or {}).get(filename, model_prefix)
+        return f'(model "{prefix}/{filename}"'
 
     return _MODEL_PATH_RE.sub(_replace, text)
 
@@ -237,7 +245,15 @@ def _import_zip(
     model_prefix: str,
     kicad_cli: Optional[Path],
     dry_run: bool,
+    models: Optional[dict[str, str]] = None,
 ) -> dict[str, list[str]]:
+    """Import one ZIP into sym_lib / fp_dir.
+
+    models maps model file names already in the library (any *.3dshapes
+    dir) or added earlier in the run to the path prefix of their dir; it is
+    updated in place, and existing models are reused instead of copied.
+    """
+    models = models if models is not None else {}
     result: dict[str, list[str]] = {
         "sym": [],
         "sym_skipped": [],
@@ -261,13 +277,14 @@ def _import_zip(
                 (".stp.gz", ".step.gz")
             ):
                 dest = models_dir / f.name
-                if dest.exists():
+                if dest.exists() or f.name in models:
                     console.print(f"  3D   skip (exists): {f.name}")
                 else:
                     console.print(f"  3D   add: {f.name}")
                     if not dry_run:
                         models_dir.mkdir(exist_ok=True)
                         shutil.copy2(f, dest)
+                    models[f.name] = model_prefix
                     result["models"].append(f.name)
 
         # Footprints
@@ -280,7 +297,7 @@ def _import_zip(
                 continue
             console.print(f"  FP   add: {f.name}")
             if not dry_run:
-                text = _fix_3d_path(f.read_text(encoding="utf-8"), model_prefix)
+                text = _fix_3d_path(f.read_text(encoding="utf-8"), model_prefix, models)
                 f.write_text(text, encoding="utf-8")
                 _upgrade_fp(f, kicad_cli)
                 fp_dir.mkdir(exist_ok=True)
@@ -349,8 +366,8 @@ def _resolve_models(
 
     A 3D library registered with 'kilm add-3d' inside lib_path is used via its
     environment variable. Otherwise models go into the library's existing
-    *.3dshapes dir (one named after the library, or the only one; else
-    <default_name>.3dshapes), referenced through the
+    *.3dshapes dir (one named after the library, else the first; a new
+    <default_name>.3dshapes if there is none), referenced through the
     library's own environment variable from kilm.yaml, which 'kilm setup'
     defines in KiCad; without one, the absolute path is used.
     """
@@ -370,17 +387,45 @@ def _resolve_models(
         models_dir = named[0]
     elif len(existing) == 1:
         models_dir = existing[0]
+    elif existing:
+        models_dir = existing[0]
+        console.print(
+            f"[yellow]Several *.3dshapes dirs in {lib_path}; new models go to "
+            f"{models_dir.name} (register the right one with 'kilm add-3d')[/yellow]"
+        )
     else:
-        if existing:
-            console.print(
-                f"[yellow]Several *.3dshapes dirs in {lib_path}; register the right "
-                f"one with 'kilm add-3d'. Using {default_name}.3dshapes[/yellow]"
-            )
         models_dir = lib_path / f"{default_name}.3dshapes"
     lib_env_var = metadata.get("env_var")
     if isinstance(lib_env_var, str) and lib_env_var:
         return models_dir, f"${{{lib_env_var}}}/{models_dir.name}"
     return models_dir, models_dir.resolve().as_posix()
+
+
+def _existing_models(
+    lib_path: Path, models_dir: Path, model_prefix: str
+) -> dict[str, str]:
+    """Model file name -> path prefix, for models already in the library.
+
+    Covers the target models dir and every other *.3dshapes dir of the
+    library, so an import reuses a model wherever it already lives.
+    """
+    lib_env_var = (read_github_metadata(lib_path) or {}).get("env_var")
+    dirs = [(models_dir, model_prefix)]
+    for d in sorted(lib_path.glob("*.3dshapes")):
+        if d.is_dir() and d.resolve() != models_dir.resolve():
+            prefix = (
+                f"${{{lib_env_var}}}/{d.name}"
+                if isinstance(lib_env_var, str) and lib_env_var
+                else d.resolve().as_posix()
+            )
+            dirs.append((d, prefix))
+    models: dict[str, str] = {}
+    for d, prefix in dirs:
+        if d.is_dir():
+            for f in d.iterdir():
+                if f.is_file():
+                    models.setdefault(f.name, prefix)
+    return models
 
 
 def import_zip(
@@ -508,6 +553,7 @@ def import_zip(
         console.print("[yellow]Dry run - no changes will be made[/yellow]")
 
     totals: dict[str, list[str]] = {"sym": [], "fp": [], "models": []}
+    models = _existing_models(lib_path, models_dir, model_prefix)
 
     for zip_path in zip_files:
         zip_path = zip_path.expanduser().resolve()
@@ -521,7 +567,14 @@ def import_zip(
         console.print(f"\n[cyan]Importing {zip_path.name}[/cyan]")
         try:
             r = _import_zip(
-                zip_path, sym_lib, fp_dir, models_dir, model_prefix, kicad_cli, dry_run
+                zip_path,
+                sym_lib,
+                fp_dir,
+                models_dir,
+                model_prefix,
+                kicad_cli,
+                dry_run,
+                models,
             )
         except Exception as exc:
             console.print(f"[red]  error: {zip_path.name}: {exc}[/red]")
