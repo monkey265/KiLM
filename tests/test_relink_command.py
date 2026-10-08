@@ -180,6 +180,9 @@ def project(tmp_path: Path, lib_tree: Path, monkeypatch: pytest.MonkeyPatch) -> 
     (kicad_config / "sym-lib-table").write_text(
         '(sym_lib_table\n\t(lib (name "CAT_IC")(type "KiCad")(uri "/a")(options "")(descr ""))\n)\n'
     )
+    (kicad_config / "fp-lib-table").write_text(
+        '(fp_lib_table\n\t(lib (name "CAT_QFN")(type "KiCad")(uri "/b")(options "")(descr ""))\n)\n'
+    )
     monkeypatch.setattr(
         "kicad_lib_manager.commands.relink.command.KiCadService.find_kicad_config_dir",
         staticmethod(lambda: kicad_config),
@@ -218,3 +221,84 @@ def test_relink_cli_skips_file_open_in_kicad(project: Path):
 
     result = runner.invoke(app, ["relink", "--force", str(project)])
     assert (project / "board.kicad_sch").read_text() == '(lib_id "CAT_IC:ADC1")\n'
+
+
+# ── Review fixes ──────────────────────────────────────────────────────────────
+
+
+def test_table_nicknames_accept_unquoted_entries(tmp_path: Path):
+    table = tmp_path / "sym-lib-table"
+    table.write_text(
+        "(sym_lib_table\n"
+        '  (lib (name Device)(type Legacy)(uri ${KICAD_SYMBOL_DIR}/Device.lib)(options "")(descr ""))\n'
+        '  (lib (name "Quoted")(type "KiCad")(uri "/q")(options "")(descr ""))\n'
+        ")\n"
+    )
+
+    assert _table_nicknames(table, {}) == {"Device", "Quoted"}
+
+
+def test_index_only_uses_registered_dirs(lib_tree: Path):
+    stray = lib_tree / "examples" / "demo"
+    stray.mkdir(parents=True)
+    (stray / "STRAY.kicad_sym").write_text(_sym_lib("ADC1"))
+    (stray / "STRAY.pretty").mkdir()
+
+    index = build_index([lib_tree], {})
+
+    assert index.symbols["ADC1"] == {"CAT_IC"}
+    assert "STRAY" not in index.managed_footprint_libs
+
+
+def test_missing_model_dir_is_skipped(lib_tree: Path):
+    index = build_index([lib_tree], {"GONE": lib_tree / "nope"})
+
+    assert index.models == {}
+
+
+def test_project_relative_model_path_resolves(index, tmp_path: Path):
+    (tmp_path / "3d").mkdir()
+    (tmp_path / "3d" / "QFN16.stp").write_text("STEP")
+    text = '(model "3d/QFN16.stp"'
+
+    r = _relink(text, index, {"KIPRJMOD": str(tmp_path)})
+
+    assert r.text == text
+
+
+def test_project_table_shadowing_managed_nickname_is_foreign(index):
+    # The project redefines CAT_RF to its own library, so CAT_RF:ADC1 is not
+    # a managed reference that moved and must stay.
+    text = '(lib_id "CAT_RF:ADC1")'
+    r = relink_text(text, index, KNOWN_SYM, KNOWN_FP, {}, shadowed={"CAT_RF"})
+
+    assert r.text == text
+
+
+def test_cached_symbol_not_duplicated(index):
+    text = (
+        '(lib_symbols\n(symbol "CAT_IC:ADC1"\n)\n(symbol "OLD:ADC1"\n)\n)\n'
+        '(lib_id "OLD:ADC1")'
+    )
+    r = _relink(text, index)
+
+    assert r.text.count('(symbol "CAT_IC:ADC1"') == 1
+    assert '(lib_id "CAT_IC:ADC1")' in r.text
+
+
+def test_kicad_env_vars_null_is_empty(tmp_path: Path):
+    from kicad_lib_manager.services.kicad_service import KiCadService
+
+    (tmp_path / "kicad_common.json").write_text('{"environment": {"vars": null}}')
+
+    assert KiCadService().get_environment_variables(tmp_path) == {}
+
+
+def test_relink_cli_refuses_without_global_tables(project: Path, tmp_path: Path):
+    (tmp_path / "kicad" / "fp-lib-table").unlink()
+
+    result = runner.invoke(app, ["relink", str(project)])
+
+    assert result.exit_code == 1
+    assert "global library tables" in result.output
+    assert (project / "board.kicad_sch").read_text() == '(lib_id "OLD:ADC1")\n'

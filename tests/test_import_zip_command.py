@@ -10,15 +10,14 @@ import pytest
 from typer.testing import CliRunner
 
 from kicad_lib_manager.commands.import_zip.command import (
-    _extract_symbol_blocks,
     _fix_3d_path,
     _fix_footprint_ref,
     _merge_symbols,
     _read_part_info,
     _safe_extractall,
-    _symbol_name,
 )
 from kicad_lib_manager.main import app
+from kicad_lib_manager.utils.kicad_sexpr import extract_symbol_blocks, symbol_name
 
 runner = CliRunner()
 
@@ -52,10 +51,10 @@ INCOMING_SYM = """\
 
 
 def test_extract_symbol_blocks():
-    blocks = _extract_symbol_blocks(INCOMING_SYM)
+    blocks = extract_symbol_blocks(INCOMING_SYM)
     assert len(blocks) == 2
-    assert _symbol_name(blocks[0]) == "NewPart"
-    assert _symbol_name(blocks[1]) == "ExistingPart"
+    assert symbol_name(blocks[0]) == "NewPart"
+    assert symbol_name(blocks[1]) == "ExistingPart"
 
 
 def test_fix_footprint_ref_adds_prefix():
@@ -79,9 +78,9 @@ def test_extract_symbol_blocks_ignores_parens_in_strings():
         "\t)\n"
         ")\n"
     )
-    blocks = _extract_symbol_blocks(text)
+    blocks = extract_symbol_blocks(text)
     assert len(blocks) == 1
-    assert _symbol_name(blocks[0]) == "PartA"
+    assert symbol_name(blocks[0]) == "PartA"
 
 
 def test_safe_extractall_rejects_zip_slip(tmp_path: Path):
@@ -597,3 +596,127 @@ def test_import_zip_rejects_missing_kicad_cli_path(
     assert (
         "CliPart" not in (library_tree / "symbols" / "SAMPLELIB.kicad_sym").read_text()
     )
+
+
+# ── Review fixes ──────────────────────────────────────────────────────────────
+
+
+def _zip_with(tmp_path: Path, name: str, files: dict[str, str]) -> Path:
+    zip_path = tmp_path / f"{name}.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for member, content in files.items():
+            zf.writestr(member, content)
+    return zip_path
+
+
+def test_symbol_points_at_library_holding_skipped_footprint(
+    tmp_path: Path, category_tree: Path
+):
+    # The footprint already lives in SAMPLELIB.pretty; the import targets
+    # CAT_QFN. The new symbol must reference SAMPLELIB:Shared, not CAT_QFN.
+    (category_tree / "footprints" / "SAMPLELIB.pretty" / "Shared.kicad_mod").write_text(
+        '(footprint "Shared")\n'
+    )
+    zip_path = _zip_with(
+        tmp_path,
+        "NewChip",
+        {
+            "NewChip/KiCad/NewChip.kicad_sym": (
+                '(kicad_symbol_lib\n\t(symbol "NewChip"\n'
+                '\t\t(property "Footprint" "Shared")\n\t)\n)\n'
+            ),
+            "NewChip/KiCad/Shared.kicad_mod": '(footprint "Shared")\n',
+        },
+    )
+
+    result = _run_import("-s", "CAT_IC", "-f", "CAT_QFN", str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    text = (category_tree / "symbols" / "CAT_IC.kicad_sym").read_text()
+    assert '"Footprint" "SAMPLELIB:Shared"' in text
+
+
+def test_vendor_footprint_prefix_is_replaced_for_imported_footprint(
+    tmp_path: Path, category_tree: Path
+):
+    zip_path = _zip_with(
+        tmp_path,
+        "VendChip",
+        {
+            "VendChip/KiCad/VendChip.kicad_sym": (
+                '(kicad_symbol_lib\n\t(symbol "VendChip"\n'
+                '\t\t(property "Footprint" "SamacSys_Parts:VENDFP")\n\t)\n)\n'
+            ),
+            "VendChip/KiCad/VENDFP.kicad_mod": '(footprint "VENDFP")\n',
+        },
+    )
+
+    result = _run_import("-s", "CAT_IC", "-f", "CAT_QFN", str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    text = (category_tree / "symbols" / "CAT_IC.kicad_sym").read_text()
+    assert '"Footprint" "CAT_QFN:VENDFP"' in text
+
+
+def test_fallback_models_use_library_env_var(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    # No 3D library registered: models go to <lib>.3dshapes and footprints
+    # reference it through the library's env var from kilm.yaml.
+    (library_tree / "kilm.yaml").write_text(
+        "name: mylib\nenv_var: KICAD_LIB_MYLIB\n", encoding="utf-8"
+    )
+    zip_path = _zip_with(
+        tmp_path,
+        "M1",
+        {
+            "M1/KiCad/M1.kicad_sym": '(kicad_symbol_lib\n\t(symbol "M1"\n\t)\n)\n',
+            "M1/KiCad/M1.kicad_mod": '(footprint "M1"\n\t(model "C:/x/M1.stp"\n\t)\n)\n',
+            "M1/3D/M1.stp": "STEP",
+        },
+    )
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    fp = (library_tree / "footprints" / "SAMPLELIB.pretty" / "M1.kicad_mod").read_text()
+    assert '(model "${KICAD_LIB_MYLIB}/SAMPLELIB.3dshapes/M1.stp"' in fp
+    assert (library_tree / "SAMPLELIB.3dshapes" / "M1.stp").exists()
+
+
+def test_fallback_models_without_env_var_use_absolute_path(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    zip_path = _zip_with(
+        tmp_path,
+        "M2",
+        {
+            "M2/KiCad/M2.kicad_mod": '(footprint "M2"\n\t(model "M2.stp"\n\t)\n)\n',
+            "M2/3D/M2.stp": "STEP",
+        },
+    )
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    fp = (library_tree / "footprints" / "SAMPLELIB.pretty" / "M2.kicad_mod").read_text()
+    expected = (library_tree / "SAMPLELIB.3dshapes").resolve().as_posix()
+    assert f'(model "{expected}/M2.stp"' in fp
+    assert "KICAD_3RD_PARTY" not in fp
+
+
+def test_unreadable_zip_does_not_abort_batch(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    bad = tmp_path / "bad.zip"
+    with zipfile.ZipFile(bad, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("bad/part_info.txt", "PartCategory=Integrated Circuit\n")
+    raw = bad.read_bytes()
+    bad.write_bytes(raw.replace(b"Integrated", b"Corrupted!", 1))  # CRC mismatch
+    good = _make_samacsys_zip(tmp_path, "AfterBad")
+
+    result = _run_import(str(bad), str(good))
+
+    assert result.exit_code == 1
+    assert "Failed: bad.zip" in result.output
+    assert "AfterBad" in (library_tree / "symbols" / "SAMPLELIB.kicad_sym").read_text()

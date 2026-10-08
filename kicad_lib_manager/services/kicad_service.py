@@ -28,8 +28,9 @@ class KiCadService:
             with kicad_common.open() as f:
                 config = json.load(f)
 
-            if "environment" in config and "vars" in config["environment"]:
-                return config["environment"]["vars"]
+            env_vars = (config.get("environment") or {}).get("vars")
+            if isinstance(env_vars, dict):
+                return env_vars
 
         except Exception:
             pass

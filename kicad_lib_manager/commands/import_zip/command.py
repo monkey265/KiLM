@@ -14,6 +14,7 @@ import typer
 from rich.console import Console
 
 from ...services.config_service import Config, LibraryDict
+from ...utils.kicad_sexpr import extract_symbol_blocks, symbol_name
 from ...utils.metadata import read_cloud_metadata, read_github_metadata
 
 console = Console()
@@ -21,53 +22,23 @@ console = Console()
 # ── Symbol helpers ────────────────────────────────────────────────────────────
 
 
-def _extract_symbol_blocks(text: str) -> list[str]:
-    """Extract top-level `(symbol "...")` blocks by tracking paren depth.
+def _fix_footprint_ref(
+    block: str, lib_name: str, fp_libs: Optional[dict[str, str]] = None
+) -> str:
+    """Point the symbol's Footprint field at a library.
 
-    Depth-based (not indentation-based) so it works regardless of whether
-    the generator indents with tabs (SamacSys/Mouser) or spaces
-    (UltraLibrarian), and regardless of line endings.
+    fp_libs maps footprint names from the same ZIP to the library that holds
+    them (the target, or the library where an existing copy was found); those
+    win over any vendor prefix. Other bare names get lib_name; other prefixed
+    names are left alone.
     """
-    blocks: list[str] = []
-    depth = 0
-    in_str = False
-    block_start: Optional[int] = None
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if in_str:
-            if ch == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if ch == '"':
-                in_str = False
-            i += 1
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "(":
-            if depth == 1 and text.startswith('(symbol "', i):
-                block_start = i
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 1 and block_start is not None:
-                blocks.append(text[block_start : i + 1])
-                block_start = None
-        i += 1
-    return blocks
 
-
-def _symbol_name(block: str) -> str:
-    m = re.match(r'\(symbol "([^"]+)"', block)
-    return m.group(1) if m else ""
-
-
-def _fix_footprint_ref(block: str, lib_name: str) -> str:
     def _replace(m: re.Match[str]) -> str:
         val = m.group(1)
-        if ":" not in val:
+        name = val.split(":", 1)[1] if ":" in val else val
+        if fp_libs and name in fp_libs:
+            val = f"{fp_libs[name]}:{name}"
+        elif ":" not in val:
             val = f"{lib_name}:{val}"
         return f'"Footprint" "{val}"'
 
@@ -80,22 +51,23 @@ def _merge_symbols(
     lib_name: str,
     dry_run: bool,
     elsewhere: frozenset[str] = frozenset(),
+    fp_libs: Optional[dict[str, str]] = None,
 ) -> tuple[list[str], list[str]]:
     """Append new symbols to sym_lib; skip names already in it or in elsewhere."""
     src_text = src_file.read_text(encoding="utf-8")
     dest_text = sym_lib.read_text(encoding="utf-8")
-    existing = {_symbol_name(b) for b in _extract_symbol_blocks(dest_text)} | elsewhere
+    existing = {symbol_name(b) for b in extract_symbol_blocks(dest_text)} | elsewhere
 
     added: list[str] = []
     skipped: list[str] = []
     new_blocks: list[str] = []
 
-    for block in _extract_symbol_blocks(src_text):
-        name = _symbol_name(block)
+    for block in extract_symbol_blocks(src_text):
+        name = symbol_name(block)
         if name in existing:
             skipped.append(name)
             continue
-        block = _fix_footprint_ref(block, lib_name)
+        block = _fix_footprint_ref(block, lib_name, fp_libs)
         new_blocks.append(block)
         added.append(name)
 
@@ -218,14 +190,14 @@ def _safe_extractall(zf: zipfile.ZipFile, dest: Path) -> None:
 # ── Per-ZIP import ────────────────────────────────────────────────────────────
 
 
-def _symbol_names(sym_libs: list[Path]) -> frozenset[str]:
+def _symbol_names(sym_libs: list[Path]) -> set[str]:
     names: set[str] = set()
     for lib in sym_libs:
         names |= {
-            _symbol_name(b)
-            for b in _extract_symbol_blocks(lib.read_text(encoding="utf-8"))
+            symbol_name(b)
+            for b in extract_symbol_blocks(lib.read_text(encoding="utf-8"))
         }
-    return frozenset(names)
+    return names
 
 
 def _import_zip(
@@ -236,16 +208,17 @@ def _import_zip(
     model_prefix: str,
     kicad_cli: Optional[Path],
     dry_run: bool,
-    all_sym_libs: Optional[list[Path]] = None,
+    known_symbols: frozenset[str] = frozenset(),
     all_fp_dirs: Optional[list[Path]] = None,
 ) -> dict[str, list[str]]:
     """Import one ZIP into sym_lib / fp_dir.
 
-    Parts already present in any of all_sym_libs / all_fp_dirs (the other
-    libraries of a split library) are skipped rather than duplicated.
+    Symbols named in known_symbols and footprints present in any of
+    all_fp_dirs (the other libraries of a split library) are skipped rather
+    than duplicated.
     """
-    other_sym_libs = [lib for lib in all_sym_libs or [] if lib != sym_lib]
     fp_dirs = [fp_dir] + [d for d in all_fp_dirs or [] if d != fp_dir]
+    fp_libs: dict[str, str] = {}
     result: dict[str, list[str]] = {
         "sym": [],
         "sym_skipped": [],
@@ -285,8 +258,10 @@ def _import_zip(
             if existing_in is not None:
                 where = "" if existing_in == fp_dir else f" in {existing_in.stem}"
                 console.print(f"  FP   skip (exists{where}): {f.name}")
+                fp_libs[f.stem] = existing_in.stem
                 continue
             console.print(f"  FP   add: {f.name}")
+            fp_libs[f.stem] = fp_dir.stem
             if not dry_run:
                 text = _fix_3d_path(f.read_text(encoding="utf-8"), model_prefix)
                 f.write_text(text, encoding="utf-8")
@@ -300,7 +275,7 @@ def _import_zip(
             if not dry_run:
                 _upgrade_sym(f, kicad_cli)
             added, skipped = _merge_symbols(
-                f, sym_lib, fp_dir.stem, dry_run, _symbol_names(other_sym_libs)
+                f, sym_lib, fp_dir.stem, dry_run, known_symbols, fp_libs
             )
             for name in added:
                 console.print(f"  SYM  add: {name}")
@@ -410,13 +385,15 @@ def _choose_lib(
 
 
 def _resolve_models(
-    lib_path: Path, lib_name: str, cloud_libs: list[LibraryDict]
+    lib_path: Path, default_name: str, cloud_libs: list[LibraryDict]
 ) -> tuple[Path, str]:
-    """Return (models dir, model path prefix).
+    """Return (models dir, model path prefix) for the whole library.
 
     A 3D library registered with 'kilm add-3d' inside lib_path is used via its
-    environment variable; otherwise fall back to <lib_name>.3dshapes under
-    ${KICAD_3RD_PARTY}.
+    environment variable. Otherwise models go into the library's existing
+    *.3dshapes dir (or <default_name>.3dshapes), referenced through the
+    library's own environment variable from kilm.yaml, which 'kilm setup'
+    defines in KiCad; without one, the absolute path is used.
     """
     for lib in cloud_libs:
         models_dir = Path(lib["path"])
@@ -426,10 +403,12 @@ def _resolve_models(
         env_var = metadata.get("env_var")
         if isinstance(env_var, str) and env_var:
             return models_dir, f"${{{env_var}}}"
-    return (
-        lib_path / f"{lib_name}.3dshapes",
-        f"${{KICAD_3RD_PARTY}}/{lib_name}.3dshapes",
-    )
+    existing = sorted(d for d in lib_path.glob("*.3dshapes") if d.is_dir())
+    models_dir = existing[0] if existing else lib_path / f"{default_name}.3dshapes"
+    lib_env_var = (read_github_metadata(lib_path) or {}).get("env_var")
+    if isinstance(lib_env_var, str) and lib_env_var:
+        return models_dir, f"${{{lib_env_var}}}/{models_dir.name}"
+    return models_dir, models_dir.resolve().as_posix()
 
 
 def import_zip(
@@ -531,7 +510,10 @@ def import_zip(
     _check_lib_name(fp_candidates, footprint_lib, "footprint")
     sym_map = _category_map(lib_path, "symbols")
     fp_map = _category_map(lib_path, "footprints")
-    cloud_libs = config.get_libraries(library_type="cloud")
+    models_dir, model_prefix = _resolve_models(
+        lib_path, sym_candidates[0].stem, config.get_libraries(library_type="cloud")
+    )
+    known_symbols = _symbol_names(sym_candidates)
 
     # Resolve kicad-cli
     if kicad_cli_path is not None and not kicad_cli_path.exists():
@@ -548,6 +530,7 @@ def import_zip(
 
     totals: dict[str, list[str]] = {"sym": [], "fp": [], "models": []}
     unplaced: list[str] = []
+    failed: list[str] = []
 
     for zip_path in zip_files:
         zip_path = zip_path.expanduser().resolve()
@@ -559,7 +542,12 @@ def import_zip(
             continue
 
         console.print(f"\n[cyan]Importing {zip_path.name}[/cyan]")
-        info = _read_part_info(zip_path)
+        try:
+            info = _read_part_info(zip_path)
+        except Exception as exc:
+            console.print(f"[red]  error: {zip_path.name}: {exc}[/red]")
+            failed.append(zip_path.name)
+            continue
         sym_lib = _choose_lib(
             sym_candidates,
             symbol_lib,
@@ -579,7 +567,6 @@ def import_zip(
         if sym_lib is None or fp_dir is None:
             unplaced.append(zip_path.name)
             continue
-        models_dir, model_prefix = _resolve_models(lib_path, sym_lib.stem, cloud_libs)
         console.print(
             f"[dim]  Target: {sym_lib.stem} / {fp_dir.stem} / {model_prefix}[/dim]"
         )
@@ -592,12 +579,14 @@ def import_zip(
                 model_prefix,
                 kicad_cli,
                 dry_run,
-                sym_candidates,
+                frozenset(known_symbols),
                 fp_candidates,
             )
         except Exception as exc:
             console.print(f"[red]  error: {zip_path.name}: {exc}[/red]")
+            failed.append(zip_path.name)
             continue
+        known_symbols.update(r["sym"])
         totals["sym"].extend(r["sym"])
         totals["fp"].extend(r["fp"])
         totals["models"].extend(r["models"])
@@ -623,4 +612,7 @@ def import_zip(
         console.print(
             f"[red]Not imported (no target library): {', '.join(unplaced)}[/red]"
         )
+    if failed:
+        console.print(f"[red]Failed: {', '.join(failed)}[/red]")
+    if unplaced or failed:
         raise typer.Exit(1)
