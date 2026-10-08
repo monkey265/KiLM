@@ -21,6 +21,7 @@ from rich.console import Console
 from ...services.config_service import Config
 from ...services.kicad_service import KiCadService
 from ...utils.backup import create_backup
+from ...utils.kicad_install import kicad_install_vars
 from ...utils.kicad_sexpr import extract_symbol_blocks, symbol_name
 from ...utils.metadata import read_cloud_metadata
 
@@ -106,11 +107,12 @@ def _relink_refs(
     known_nicknames: set[str],
     shadowed: set[str],
     tables_complete: bool,
+    track_cache: bool = False,
 ) -> None:
     # Cached symbol names present now or created by this pass, so two broken
     # cache entries for the same part are not both renamed to one name.
     cached: set[str] = set()
-    if pattern is _SYMBOL_REF_RE:
+    if track_cache:
         cached = set(re.findall(r'\(symbol "([^"]+:[^"]+)"', result.text))
 
     def _replace(m: re.Match[str]) -> str:
@@ -119,13 +121,14 @@ def _relink_refs(
             broken = item not in managed[nick]
         else:
             broken = nick not in known_nicknames
-            if broken and not tables_complete:
-                # The nickname may live in a lib table that could not be read.
-                result.unresolved.append(
-                    f"{kind} {nick}:{item} (library tables incomplete, not rewritten)"
-                )
-                return m.group(0)
         if not broken:
+            return m.group(0)
+        if not tables_complete:
+            # A lib table that could not be read may define this nickname, or
+            # redefine a managed one, so nothing can be rewritten safely.
+            result.unresolved.append(
+                f"{kind} {nick}:{item} (library tables incomplete, not rewritten)"
+            )
             return m.group(0)
         candidates = sorted(provided_by.get(item, set()))
         if len(candidates) != 1:
@@ -135,7 +138,7 @@ def _relink_refs(
             result.unresolved.append(f"{kind} {nick}:{item} ({reason})")
             return m.group(0)
         new_ref = f"{candidates[0]}:{item}"
-        if m.group(1) == '(symbol "':
+        if track_cache and m.group(1) == '(symbol "':
             if new_ref in cached:
                 # The target symbol is already cached; renaming this entry
                 # would duplicate it. KiCad drops the orphan on save.
@@ -186,8 +189,8 @@ def relink_text(
     treated as foreign libraries.
     env resolves ${VAR} in 3D model paths (KIPRJMOD for relative ones).
     With tables_complete False (a nested lib table could not be read),
-    references to unknown libraries are reported instead of rewritten;
-    items that left a managed library are still repaired.
+    broken references are reported instead of rewritten; 3D model paths are
+    still repaired.
     """
     result = RelinkResult(text)
     _relink_refs(
@@ -199,6 +202,7 @@ def relink_text(
         known_sym,
         shadowed_sym or set(),
         tables_complete,
+        track_cache=True,
     )
     _relink_refs(
         result,
@@ -290,8 +294,8 @@ def _warn_missing_tables(missing: list[str]) -> None:
         else "check the paths"
     )
     console.print(
-        "[yellow]References to libraries not otherwise known are reported, not "
-        f"rewritten. To include them, {hint}.[/yellow]"
+        "[yellow]Broken symbol/footprint references are reported, not rewritten. "
+        f"To fix them, {hint}.[/yellow]"
     )
 
 
@@ -382,7 +386,11 @@ def relink(
             model_dirs[env_var] = Path(lib["path"])
 
     kicad_config = KiCadService.find_kicad_config_dir()
-    env = {**os.environ, **KiCadService().get_environment_variables(kicad_config)}
+    env = {
+        **kicad_install_vars(),
+        **os.environ,
+        **KiCadService().get_environment_variables(kicad_config),
+    }
     missing: list[str] = []
     global_sym = set(
         _table_entries(kicad_config / "sym-lib-table", env, missing=missing)

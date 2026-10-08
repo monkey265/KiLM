@@ -184,6 +184,10 @@ def project(tmp_path: Path, lib_tree: Path, monkeypatch: pytest.MonkeyPatch) -> 
     (kicad_config / "fp-lib-table").write_text(
         '(fp_lib_table\n\t(lib (name "CAT_QFN")(type "KiCad")(uri "/b")(options "")(descr ""))\n)\n'
     )
+    # Tests must not depend on a KiCad installed on the machine running them.
+    monkeypatch.setattr(
+        "kicad_lib_manager.commands.relink.command.kicad_install_vars", lambda: {}
+    )
     monkeypatch.setattr(
         "kicad_lib_manager.commands.relink.command.KiCadService.find_kicad_config_dir",
         staticmethod(lambda: kicad_config),
@@ -361,7 +365,7 @@ def test_unresolved_nested_table_is_reported(tmp_path: Path):
     assert missing == ["${UNSET}/sym-lib-table"]
 
 
-def test_missing_nested_global_table_degrades_instead_of_failing(
+def test_missing_nested_global_table_reports_instead_of_rewriting(
     project: Path, tmp_path: Path
 ):
     table = tmp_path / "kicad" / "sym-lib-table"
@@ -381,9 +385,10 @@ def test_missing_nested_global_table_degrades_instead_of_failing(
     assert result.exit_code == 0, result.output
     assert "export KICAD9_TEMPLATE_DIR=..." in result.output
     assert "OLD:ADC1 (library tables incomplete, not rewritten)" in result.output
-    # A part that left a managed library is still repaired.
+    # The unreadable table could redefine CAT_RF too, so nothing is rewritten.
+    assert "CAT_RF:ADC1 (library tables incomplete, not rewritten)" in result.output
     assert (project / "board.kicad_sch").read_text() == (
-        '(lib_id "OLD:ADC1")\n(lib_id "CAT_IC:ADC1")\n'
+        '(lib_id "OLD:ADC1")\n(lib_id "CAT_RF:ADC1")\n'
     )
 
 
@@ -397,3 +402,36 @@ def test_missing_nested_project_table_is_reported(project: Path):
 
     assert "Library tables not found: ${VENDOR_DIR}/sym-lib-table" in result.output
     assert (project / "board.kicad_sch").read_text() == '(lib_id "OLD:ADC1")\n'
+
+
+def test_nested_table_resolved_via_kicad_install(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    share = tmp_path / "share" / "kicad"
+    (share / "template").mkdir(parents=True)
+    (share / "template" / "sym-lib-table").write_text(
+        '(sym_lib_table\n\t(lib (name "Device")(type "KiCad")(uri "x")(options "")(descr ""))\n)\n'
+    )
+    monkeypatch.setattr(
+        "kicad_lib_manager.commands.relink.command.kicad_install_vars",
+        lambda: {"KICAD9_TEMPLATE_DIR": str(share / "template")},
+    )
+    table = tmp_path / "kicad" / "sym-lib-table"
+    table.write_text(
+        table.read_text().replace(
+            "(sym_lib_table\n",
+            '(sym_lib_table\n\t(lib (name "KiCad")(type "Table")'
+            '(uri "${KICAD9_TEMPLATE_DIR}/sym-lib-table")(options "")(descr ""))\n',
+        )
+    )
+    (project / "board.kicad_sch").write_text(
+        '(lib_id "Device:R")\n(lib_id "OLD:ADC1")\n'
+    )
+
+    result = runner.invoke(app, ["relink", str(project)])
+
+    assert result.exit_code == 0, result.output
+    assert "not found" not in result.output
+    assert (project / "board.kicad_sch").read_text() == (
+        '(lib_id "Device:R")\n(lib_id "CAT_IC:ADC1")\n'
+    )

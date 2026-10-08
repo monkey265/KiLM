@@ -16,6 +16,8 @@ import typer
 from rich.console import Console
 
 from ...services.config_service import Config, LibraryDict
+from ...utils.kicad_install import build_kicad_cli_cmd as _build_kicad_cli_cmd
+from ...utils.kicad_install import detect_kicad_cli as _detect_kicad_cli
 from ...utils.kicad_sexpr import extract_symbol_blocks, symbol_name
 from ...utils.metadata import read_cloud_metadata, read_github_metadata
 
@@ -55,10 +57,17 @@ def _merge_symbols(
     elsewhere: Set[str] = frozenset(),
     fp_libs: Optional[dict[str, str]] = None,
 ) -> tuple[list[str], list[str]]:
-    """Append new symbols to sym_lib; skip names already in it or in elsewhere."""
+    """Append new symbols to sym_lib, skipping names already known.
+
+    elsewhere, when given, is every symbol name already in the library
+    (sym_lib included); otherwise sym_lib itself is read. A name repeated
+    within src_file is added once.
+    """
     src_text = src_file.read_text(encoding="utf-8")
     dest_text = sym_lib.read_text(encoding="utf-8")
-    existing = {symbol_name(b) for b in extract_symbol_blocks(dest_text)}
+    known: Set[str] = elsewhere or {
+        symbol_name(b) for b in extract_symbol_blocks(dest_text)
+    }
 
     added: list[str] = []
     skipped: list[str] = []
@@ -66,7 +75,7 @@ def _merge_symbols(
 
     for block in extract_symbol_blocks(src_text):
         name = symbol_name(block)
-        if name in existing or name in elsewhere:
+        if name in known or name in added:
             skipped.append(name)
             continue
         block = _fix_footprint_ref(block, lib_name, fp_libs)
@@ -95,19 +104,19 @@ _MODEL_PATH_RE = re.compile(
 
 
 def _fix_3d_path(
-    text: str, model_prefix: str, prefixes: Optional[Mapping[str, str]] = None
+    text: str, model_prefix: str, known: Optional[Mapping[str, str]] = None
 ) -> str:
     """Point every model path at model_prefix, e.g. "${KICAD_3D_MYLIB}".
 
-    prefixes maps model file names to the prefix of the dir that already
-    holds them; those win over model_prefix.
+    known maps lower-cased model file names to the path of a model already in
+    the library; those win over model_prefix.
     """
 
     def _replace(m: re.Match[str]) -> str:
         raw = m.group(1) if m.group(1) is not None else m.group(2)
         filename = Path(raw.replace("\\", "/")).name
-        prefix = (prefixes or {}).get(filename, model_prefix)
-        return f'(model "{prefix}/{filename}"'
+        path = (known or {}).get(filename.lower(), f"{model_prefix}/{filename}")
+        return f'(model "{path}"'
 
     return _MODEL_PATH_RE.sub(_replace, text)
 
@@ -170,13 +179,6 @@ def _upgrade_sym(sym_file: Path, kicad_cli: Optional[Path]) -> None:
         )
 
 
-def _build_kicad_cli_cmd(kicad_cli: Path, *args: str) -> list[str]:
-    """Return the command list for kicad-cli, inserting the subcommand for AppImages."""
-    if kicad_cli.suffix.lower() == ".appimage":
-        return [str(kicad_cli), "kicad-cli", *args]
-    return [str(kicad_cli), *args]
-
-
 # ── ZIP extraction ───────────────────────────────────────────────────────────
 
 
@@ -220,7 +222,7 @@ class _RunState:
     known_symbols: set[str]
     # footprint name -> library holding it, for footprints added this run
     footprints: dict[str, str] = field(default_factory=dict)
-    # model file name -> path prefix of the dir holding it (existing + added)
+    # lower-cased model file name -> model path (existing + added this run)
     models: dict[str, str] = field(default_factory=dict)
 
 
@@ -264,14 +266,20 @@ def _import_zip(
             if f.suffix.lower() in (".stp", ".step") or f.name.lower().endswith(
                 (".stp.gz", ".step.gz")
             ):
-                if f.name in state.models:
+                existing = state.models.get(f.name.lower())
+                if existing == f"{model_prefix}/{f.name}":
                     console.print(f"  3D   skip (exists): {f.name}")
+                    continue
+                if existing is not None:
+                    # Same file name elsewhere in the library: reuse it rather
+                    # than keep two models with one name.
+                    console.print(f"  3D   reuse existing {existing} for {f.name}")
                     continue
                 console.print(f"  3D   add: {f.name}")
                 if not dry_run:
                     models_dir.mkdir(exist_ok=True)
                     shutil.copy2(f, models_dir / f.name)
-                state.models[f.name] = model_prefix
+                state.models[f.name.lower()] = f"{model_prefix}/{f.name}"
                 result["models"].append(f.name)
 
         # Footprints
@@ -318,51 +326,29 @@ def _import_zip(
 
 
 def _existing_models(
-    lib_path: Path, models_dir: Path, model_prefix: str
+    lib_path: Path, models_dir: Path, model_prefix: str, lib_env_var: object
 ) -> dict[str, str]:
-    """Model file name -> path prefix, for models already in the library.
+    """Lower-cased model file name -> model path, for models already in the library.
 
     Covers the target models dir and every other *.3dshapes dir of the
-    library, so an import reuses a model wherever it already lives.
+    library, so an import reuses a model wherever it already lives. Names are
+    matched case-insensitively: on Windows and macOS "X.STEP" and "X.step"
+    are the same file.
     """
-    lib_env_var = (read_github_metadata(lib_path) or {}).get("env_var")
     dirs = [(models_dir, model_prefix)]
     for d in sorted(lib_path.glob("*.3dshapes")):
         if d.is_dir() and d.resolve() != models_dir.resolve():
-            prefix = (
-                f"${{{lib_env_var}}}/{d.name}"
-                if isinstance(lib_env_var, str) and lib_env_var
-                else d.resolve().as_posix()
-            )
-            dirs.append((d, prefix))
+            dirs.append((d, _dir_prefix(d, lib_env_var)))
     models: dict[str, str] = {}
     for d, prefix in dirs:
         if d.is_dir():
-            for f in d.iterdir():
-                if f.is_file():
-                    models.setdefault(f.name, prefix)
+            for f in sorted(d.iterdir()):
+                if f.is_file() and not f.name.startswith("."):
+                    models.setdefault(f.name.lower(), f"{prefix}/{f.name}")
     return models
 
 
 # ── Command ───────────────────────────────────────────────────────────────────
-
-_KICAD_CLI_CANDIDATES: tuple[Path, ...] = (
-    Path.home() / "AppImages" / "kicad.appimage",
-    Path("/usr/bin/kicad-cli"),
-    Path("/usr/local/bin/kicad-cli"),
-    Path("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
-)
-
-
-def _detect_kicad_cli() -> Optional[Path]:
-    """Return kicad-cli path if found on PATH or a location in _KICAD_CLI_CANDIDATES."""
-    on_path = shutil.which("kicad-cli")
-    if on_path is not None:
-        return Path(on_path)
-    for candidate in _KICAD_CLI_CANDIDATES:
-        if candidate.exists():
-            return candidate
-    return None
 
 
 _PART_INFO_FILE = "part_info.txt"
@@ -441,8 +427,18 @@ def _choose_lib(
     return None
 
 
+def _dir_prefix(models_dir: Path, lib_env_var: object) -> str:
+    """Model path prefix for a *.3dshapes dir at the top of the library."""
+    if isinstance(lib_env_var, str) and lib_env_var:
+        return f"${{{lib_env_var}}}/{models_dir.name}"
+    return models_dir.resolve().as_posix()
+
+
 def _resolve_models(
-    lib_path: Path, default_name: str, cloud_libs: list[LibraryDict]
+    lib_path: Path,
+    default_name: str,
+    cloud_libs: list[LibraryDict],
+    metadata: dict[str, object],
 ) -> tuple[Path, str]:
     """Return (models dir, model path prefix) for the whole library.
 
@@ -457,11 +453,10 @@ def _resolve_models(
         models_dir = Path(lib["path"])
         if not models_dir.is_relative_to(lib_path):
             continue
-        metadata = read_cloud_metadata(models_dir) or {}
-        env_var = metadata.get("env_var")
+        cloud_metadata = read_cloud_metadata(models_dir) or {}
+        env_var = cloud_metadata.get("env_var")
         if isinstance(env_var, str) and env_var:
             return models_dir, f"${{{env_var}}}"
-    metadata = read_github_metadata(lib_path) or {}
     existing = sorted(d for d in lib_path.glob("*.3dshapes") if d.is_dir())
     preferred = {default_name, str(metadata.get("name", "")), lib_path.name}
     named = [d for d in existing if d.stem in preferred]
@@ -477,10 +472,7 @@ def _resolve_models(
         )
     else:
         models_dir = lib_path / f"{default_name}.3dshapes"
-    lib_env_var = metadata.get("env_var")
-    if isinstance(lib_env_var, str) and lib_env_var:
-        return models_dir, f"${{{lib_env_var}}}/{models_dir.name}"
-    return models_dir, models_dir.resolve().as_posix()
+    return models_dir, _dir_prefix(models_dir, metadata.get("env_var"))
 
 
 def import_zip(
@@ -585,19 +577,25 @@ def import_zip(
     default_models_name = (
         sym_candidates[0].stem if len(sym_candidates) == 1 else lib_path.name
     )
+    lib_metadata = read_github_metadata(lib_path) or {}
     models_dir, model_prefix = _resolve_models(
-        lib_path, default_models_name, config.get_libraries(library_type="cloud")
+        lib_path,
+        default_models_name,
+        config.get_libraries(library_type="cloud"),
+        lib_metadata,
     )
-    if not model_prefix.startswith("${"):
+    state = _RunState(
+        known_symbols=_symbol_names(sym_candidates),
+        models=_existing_models(
+            lib_path, models_dir, model_prefix, lib_metadata.get("env_var")
+        ),
+    )
+    if not all(p.startswith("${") for p in [model_prefix, *state.models.values()]):
         console.print(
             "[yellow]3D model paths will be absolute to this machine. Set env_var "
             "in kilm.yaml (kilm init) or register a 3D library (kilm add-3d) to "
             "share the library.[/yellow]"
         )
-    state = _RunState(
-        known_symbols=_symbol_names(sym_candidates),
-        models=_existing_models(lib_path, models_dir, model_prefix),
-    )
 
     # Resolve kicad-cli
     if kicad_cli_path is not None and not kicad_cli_path.exists():
