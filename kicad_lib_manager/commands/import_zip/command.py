@@ -14,7 +14,7 @@ import typer
 from rich.console import Console
 
 from ...services.config_service import Config, LibraryDict
-from ...utils.metadata import read_cloud_metadata
+from ...utils.metadata import read_cloud_metadata, read_github_metadata
 
 console = Console()
 
@@ -75,11 +75,16 @@ def _fix_footprint_ref(block: str, lib_name: str) -> str:
 
 
 def _merge_symbols(
-    src_file: Path, sym_lib: Path, lib_name: str, dry_run: bool
+    src_file: Path,
+    sym_lib: Path,
+    lib_name: str,
+    dry_run: bool,
+    elsewhere: frozenset[str] = frozenset(),
 ) -> tuple[list[str], list[str]]:
+    """Append new symbols to sym_lib; skip names already in it or in elsewhere."""
     src_text = src_file.read_text(encoding="utf-8")
     dest_text = sym_lib.read_text(encoding="utf-8")
-    existing = {_symbol_name(b) for b in _extract_symbol_blocks(dest_text)}
+    existing = {_symbol_name(b) for b in _extract_symbol_blocks(dest_text)} | elsewhere
 
     added: list[str] = []
     skipped: list[str] = []
@@ -213,6 +218,16 @@ def _safe_extractall(zf: zipfile.ZipFile, dest: Path) -> None:
 # ── Per-ZIP import ────────────────────────────────────────────────────────────
 
 
+def _symbol_names(sym_libs: list[Path]) -> frozenset[str]:
+    names: set[str] = set()
+    for lib in sym_libs:
+        names |= {
+            _symbol_name(b)
+            for b in _extract_symbol_blocks(lib.read_text(encoding="utf-8"))
+        }
+    return frozenset(names)
+
+
 def _import_zip(
     zip_path: Path,
     sym_lib: Path,
@@ -221,7 +236,16 @@ def _import_zip(
     model_prefix: str,
     kicad_cli: Optional[Path],
     dry_run: bool,
+    all_sym_libs: Optional[list[Path]] = None,
+    all_fp_dirs: Optional[list[Path]] = None,
 ) -> dict[str, list[str]]:
+    """Import one ZIP into sym_lib / fp_dir.
+
+    Parts already present in any of all_sym_libs / all_fp_dirs (the other
+    libraries of a split library) are skipped rather than duplicated.
+    """
+    other_sym_libs = [lib for lib in all_sym_libs or [] if lib != sym_lib]
+    fp_dirs = [fp_dir] + [d for d in all_fp_dirs or [] if d != fp_dir]
     result: dict[str, list[str]] = {
         "sym": [],
         "sym_skipped": [],
@@ -257,8 +281,10 @@ def _import_zip(
         # Footprints
         for f in tmp_path.rglob("*.kicad_mod"):
             dest = fp_dir / f.name
-            if dest.exists():
-                console.print(f"  FP   skip (exists): {f.name}")
+            existing_in = next((d for d in fp_dirs if (d / f.name).exists()), None)
+            if existing_in is not None:
+                where = "" if existing_in == fp_dir else f" in {existing_in.stem}"
+                console.print(f"  FP   skip (exists{where}): {f.name}")
                 continue
             console.print(f"  FP   add: {f.name}")
             if not dry_run:
@@ -273,7 +299,9 @@ def _import_zip(
         for f in tmp_path.rglob("*.kicad_sym"):
             if not dry_run:
                 _upgrade_sym(f, kicad_cli)
-            added, skipped = _merge_symbols(f, sym_lib, fp_dir.stem, dry_run)
+            added, skipped = _merge_symbols(
+                f, sym_lib, fp_dir.stem, dry_run, _symbol_names(other_sym_libs)
+            )
             for name in added:
                 console.print(f"  SYM  add: {name}")
             for name in skipped:
@@ -305,23 +333,80 @@ def _detect_kicad_cli() -> Optional[Path]:
     return None
 
 
-def _pick_lib(
-    candidates: list[Path], name: Optional[str], kind: str, option: str
-) -> Path:
-    """Return the library called name, or the only candidate when name is None."""
-    available = ", ".join(c.stem for c in candidates)
-    if name is not None:
-        for c in candidates:
-            if c.stem == name:
-                return c
+_PART_INFO_FILE = "part_info.txt"
+
+
+def _read_part_info(zip_path: Path) -> dict[str, str]:
+    """Key=value pairs of a SamacSys part_info.txt; empty if the ZIP has none."""
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.namelist():
+            if Path(member).name == _PART_INFO_FILE:
+                text = zf.read(member).decode("utf-8", errors="replace")
+                pairs = (line.split("=", 1) for line in text.splitlines())
+                return {
+                    k.strip(): v.strip() for k, v in (p for p in pairs if len(p) == 2)
+                }
+    return {}
+
+
+def _category_map(lib_path: Path, section: str) -> dict[str, str]:
+    """import_categories.<section> from the library's kilm.yaml.
+
+    Maps a vendor category (SamacSys PartCategory for "symbols",
+    PackageCategory for "footprints") to a library name.
+    """
+    metadata = read_github_metadata(lib_path) or {}
+    categories = metadata.get("import_categories")
+    mapping = categories.get(section) if isinstance(categories, dict) else None
+    if not isinstance(mapping, dict):
+        return {}
+    return {str(k): str(v) for k, v in mapping.items()}
+
+
+def _check_lib_name(candidates: list[Path], name: Optional[str], kind: str) -> None:
+    if name is not None and name not in {c.stem for c in candidates}:
+        available = ", ".join(c.stem for c in candidates)
         console.print(f"[red]No {kind} library '{name}'. Available: {available}[/red]")
         raise typer.Exit(1)
+
+
+def _choose_lib(
+    candidates: list[Path],
+    explicit: Optional[str],
+    mapping: dict[str, str],
+    category: Optional[str],
+    kind: str,
+    option: str,
+) -> Optional[Path]:
+    """Pick the target library: explicit option, then kilm.yaml category, then the only one.
+
+    Prints why and returns None when no library can be chosen.
+    """
+    by_name = {c.stem: c for c in candidates}
+    if explicit is not None:
+        return by_name[explicit]
+    if category and category in mapping:
+        target = mapping[category]
+        if target in by_name:
+            console.print(f"[dim]  {kind}: '{category}' -> {target} (kilm.yaml)[/dim]")
+            return by_name[target]
+        console.print(
+            f"[red]  kilm.yaml maps {kind} category '{category}' to '{target}', "
+            f"which does not exist[/red]"
+        )
+        return None
     if len(candidates) == 1:
         return candidates[0]
-    console.print(
-        f"[red]Several {kind} libraries found, choose one with {option}: {available}[/red]"
+    hint = (
+        f" (category '{category}' has no entry in kilm.yaml import_categories)"
+        if category
+        else ""
     )
-    raise typer.Exit(1)
+    console.print(
+        f"[red]  Several {kind} libraries found, choose one with {option}{hint}: "
+        f"{', '.join(by_name)}[/red]"
+    )
+    return None
 
 
 def _resolve_models(
@@ -442,12 +527,11 @@ def import_zip(
         )
         raise typer.Exit(1)
 
-    sym_lib = _pick_lib(sym_candidates, symbol_lib, "symbol", "--symbol-lib")
-    fp_dir = _pick_lib(fp_candidates, footprint_lib, "footprint", "--footprint-lib")
-    models_dir, model_prefix = _resolve_models(
-        lib_path, sym_lib.stem, config.get_libraries(library_type="cloud")
-    )
-    console.print(f"[dim]Target: {sym_lib.stem} / {fp_dir.stem} / {model_prefix}[/dim]")
+    _check_lib_name(sym_candidates, symbol_lib, "symbol")
+    _check_lib_name(fp_candidates, footprint_lib, "footprint")
+    sym_map = _category_map(lib_path, "symbols")
+    fp_map = _category_map(lib_path, "footprints")
+    cloud_libs = config.get_libraries(library_type="cloud")
 
     # Resolve kicad-cli
     kicad_cli = kicad_cli_path if kicad_cli_path else _detect_kicad_cli()
@@ -460,6 +544,7 @@ def import_zip(
         console.print("[yellow]Dry run - no changes will be made[/yellow]")
 
     totals: dict[str, list[str]] = {"sym": [], "fp": [], "models": []}
+    unplaced: list[str] = []
 
     for zip_path in zip_files:
         zip_path = zip_path.expanduser().resolve()
@@ -471,9 +556,41 @@ def import_zip(
             continue
 
         console.print(f"\n[cyan]Importing {zip_path.name}[/cyan]")
+        info = _read_part_info(zip_path)
+        sym_lib = _choose_lib(
+            sym_candidates,
+            symbol_lib,
+            sym_map,
+            info.get("PartCategory"),
+            "symbol",
+            "--symbol-lib",
+        )
+        fp_dir = _choose_lib(
+            fp_candidates,
+            footprint_lib,
+            fp_map,
+            info.get("PackageCategory"),
+            "footprint",
+            "--footprint-lib",
+        )
+        if sym_lib is None or fp_dir is None:
+            unplaced.append(zip_path.name)
+            continue
+        models_dir, model_prefix = _resolve_models(lib_path, sym_lib.stem, cloud_libs)
+        console.print(
+            f"[dim]  Target: {sym_lib.stem} / {fp_dir.stem} / {model_prefix}[/dim]"
+        )
         try:
             r = _import_zip(
-                zip_path, sym_lib, fp_dir, models_dir, model_prefix, kicad_cli, dry_run
+                zip_path,
+                sym_lib,
+                fp_dir,
+                models_dir,
+                model_prefix,
+                kicad_cli,
+                dry_run,
+                sym_candidates,
+                fp_candidates,
             )
         except Exception as exc:
             console.print(f"[red]  error: {zip_path.name}: {exc}[/red]")
@@ -498,3 +615,9 @@ def import_zip(
         )
     else:
         console.print("\n[dim]Nothing new added.[/dim]")
+
+    if unplaced:
+        console.print(
+            f"[red]Not imported (no target library): {', '.join(unplaced)}[/red]"
+        )
+        raise typer.Exit(1)

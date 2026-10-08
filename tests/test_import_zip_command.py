@@ -14,6 +14,7 @@ from kicad_lib_manager.commands.import_zip.command import (
     _fix_3d_path,
     _fix_footprint_ref,
     _merge_symbols,
+    _read_part_info,
     _safe_extractall,
     _symbol_name,
 )
@@ -441,3 +442,141 @@ def test_import_zip_into_category_libs(tmp_path: Path, category_tree: Path):
     assert '(model "${KICAD_3D_CAT_MODELS}/CatPart.stp"' in fp.read_text()
     assert (category_tree / "CAT.3dshapes" / "CatPart.stp").exists()
     assert not (category_tree / "CAT_IC.3dshapes").exists()
+
+
+# ── Category mapping from kilm.yaml ──────────────────────────────────────────
+
+CATEGORY_YAML = """\
+name: mylib
+import_categories:
+  symbols:
+    Integrated Circuit: CAT_IC
+    Ferrite Bead: MISSING_LIB
+  footprints:
+    Quad Flat No-Lead: CAT_QFN
+"""
+
+
+def _with_part_info(zip_path: Path, part: str, package: str) -> Path:
+    with zipfile.ZipFile(zip_path, "a") as zf:
+        zf.writestr(
+            f"{zip_path.stem}/part_info.txt",
+            f"Manufacturer=X\r\nPartCategory={part}\r\nPackageCategory={package}\r\n",
+        )
+    return zip_path
+
+
+@pytest.fixture
+def mapped_tree(category_tree: Path) -> Path:
+    (category_tree / "kilm.yaml").write_text(CATEGORY_YAML, encoding="utf-8")
+    return category_tree
+
+
+def test_read_part_info(tmp_path: Path):
+    zip_path = _with_part_info(
+        _make_samacsys_zip(tmp_path, "P1"), "Integrated Circuit", "Quad Flat No-Lead"
+    )
+    info = _read_part_info(zip_path)
+
+    assert info["PartCategory"] == "Integrated Circuit"
+    assert info["PackageCategory"] == "Quad Flat No-Lead"
+    assert _read_part_info(_make_snapmagic_zip(tmp_path, "P2")) == {}
+
+
+def test_import_zip_uses_category_mapping(tmp_path: Path, mapped_tree: Path):
+    zip_path = _with_part_info(
+        _make_samacsys_zip(tmp_path, "MapPart"),
+        "Integrated Circuit",
+        "Quad Flat No-Lead",
+    )
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert "'Integrated Circuit' -> CAT_IC (kilm.yaml)" in result.output
+    assert "MapPart" in (mapped_tree / "symbols" / "CAT_IC.kicad_sym").read_text()
+    assert (
+        mapped_tree / "footprints" / "CAT_QFN.pretty" / "MapPart.kicad_mod"
+    ).exists()
+
+
+def test_import_zip_options_override_mapping(tmp_path: Path, mapped_tree: Path):
+    zip_path = _with_part_info(
+        _make_samacsys_zip(tmp_path, "OvPart"),
+        "Integrated Circuit",
+        "Quad Flat No-Lead",
+    )
+
+    result = _run_import("-s", "SAMPLELIB", "-f", "SAMPLELIB", str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert "OvPart" in (mapped_tree / "symbols" / "SAMPLELIB.kicad_sym").read_text()
+    assert "OvPart" not in (mapped_tree / "symbols" / "CAT_IC.kicad_sym").read_text()
+
+
+def test_import_zip_unmapped_category_needs_option(tmp_path: Path, mapped_tree: Path):
+    zip_path = _with_part_info(
+        _make_samacsys_zip(tmp_path, "UnPart"), "Connector", "Quad Flat No-Lead"
+    )
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 1
+    assert "category 'Connector' has no entry in kilm.yaml" in result.output
+    assert "Not imported (no target library): LIB_UnPart.zip" in result.output
+
+
+def test_import_zip_mapping_to_missing_library_is_reported(
+    tmp_path: Path, mapped_tree: Path
+):
+    zip_path = _with_part_info(
+        _make_samacsys_zip(tmp_path, "FbPart"), "Ferrite Bead", "Quad Flat No-Lead"
+    )
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 1
+    assert "to 'MISSING_LIB', which does not exist" in result.output
+
+
+def test_import_zip_batch_places_each_zip_separately(tmp_path: Path, mapped_tree: Path):
+    good = _with_part_info(
+        _make_samacsys_zip(tmp_path, "GoodPart"),
+        "Integrated Circuit",
+        "Quad Flat No-Lead",
+    )
+    bad = _with_part_info(_make_samacsys_zip(tmp_path, "BadPart"), "Connector", "Other")
+
+    result = _run_import(str(good), str(bad))
+
+    assert result.exit_code == 1
+    assert "GoodPart" in (mapped_tree / "symbols" / "CAT_IC.kicad_sym").read_text()
+    assert "LIB_BadPart.zip" in result.output
+
+
+def test_import_zip_skips_parts_already_in_another_category(
+    tmp_path: Path, category_tree: Path
+):
+    # ExistingPart lives in SAMPLELIB (symbol) and a footprint of the same
+    # name already sits in SAMPLELIB.pretty; importing into the CAT_* libraries
+    # must not duplicate either.
+    (
+        category_tree / "footprints" / "SAMPLELIB.pretty" / "ExistingPart.kicad_mod"
+    ).write_text('(footprint "ExistingPart")\n')
+    (category_tree / "symbols" / "CAT_IC.kicad_sym").write_text(
+        "(kicad_symbol_lib\n)\n", encoding="utf-8"
+    )
+    zip_path = _make_samacsys_zip(tmp_path, "ExistingPart")
+
+    result = _run_import("-s", "CAT_IC", "-f", "CAT_QFN", str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert "SYM  skip (exists): ExistingPart" in result.output
+    assert "FP   skip (exists in SAMPLELIB): ExistingPart.kicad_mod" in result.output
+    assert (
+        "ExistingPart"
+        not in (category_tree / "symbols" / "CAT_IC.kicad_sym").read_text()
+    )
+    assert not (
+        category_tree / "footprints" / "CAT_QFN.pretty" / "ExistingPart.kicad_mod"
+    ).exists()
