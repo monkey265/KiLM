@@ -104,7 +104,7 @@ def _merge_symbols(
 
     for block in _extract_symbol_blocks(src_text):
         name = _symbol_name(block)
-        if name in existing:
+        if name in existing or name in added:
             skipped.append(name)
             continue
         block = _fix_footprint_ref(block, lib_name, fp_libs)
@@ -277,8 +277,12 @@ def _import_zip(
                 (".stp.gz", ".step.gz")
             ):
                 dest = models_dir / f.name
-                if dest.exists() or f.name in models:
+                if dest.exists():
                     console.print(f"  3D   skip (exists): {f.name}")
+                elif f.name in models:
+                    console.print(
+                        f"  3D   reuse existing {models[f.name]}/{f.name} for {f.name}"
+                    )
                 else:
                     console.print(f"  3D   add: {f.name}")
                     if not dry_run:
@@ -359,6 +363,13 @@ def _pick_lib(
     raise typer.Exit(1)
 
 
+def _dir_prefix(models_dir: Path, lib_env_var: object) -> str:
+    """Model path prefix for a *.3dshapes dir at the top of the library."""
+    if isinstance(lib_env_var, str) and lib_env_var:
+        return f"${{{lib_env_var}}}/{models_dir.name}"
+    return models_dir.resolve().as_posix()
+
+
 def _resolve_models(
     lib_path: Path, default_name: str, cloud_libs: list[LibraryDict]
 ) -> tuple[Path, str]:
@@ -395,10 +406,7 @@ def _resolve_models(
         )
     else:
         models_dir = lib_path / f"{default_name}.3dshapes"
-    lib_env_var = metadata.get("env_var")
-    if isinstance(lib_env_var, str) and lib_env_var:
-        return models_dir, f"${{{lib_env_var}}}/{models_dir.name}"
-    return models_dir, models_dir.resolve().as_posix()
+    return models_dir, _dir_prefix(models_dir, metadata.get("env_var"))
 
 
 def _existing_models(
@@ -413,12 +421,7 @@ def _existing_models(
     dirs = [(models_dir, model_prefix)]
     for d in sorted(lib_path.glob("*.3dshapes")):
         if d.is_dir() and d.resolve() != models_dir.resolve():
-            prefix = (
-                f"${{{lib_env_var}}}/{d.name}"
-                if isinstance(lib_env_var, str) and lib_env_var
-                else d.resolve().as_posix()
-            )
-            dirs.append((d, prefix))
+            dirs.append((d, _dir_prefix(d, lib_env_var)))
     models: dict[str, str] = {}
     for d, prefix in dirs:
         if d.is_dir():
@@ -531,7 +534,8 @@ def import_zip(
     models_dir, model_prefix = _resolve_models(
         lib_path, default_models_name, config.get_libraries(library_type="cloud")
     )
-    if not model_prefix.startswith("${"):
+    models = _existing_models(lib_path, models_dir, model_prefix)
+    if not all(p.startswith("${") for p in [model_prefix, *models.values()]):
         console.print(
             "[yellow]3D model paths will be absolute to this machine. Set env_var "
             "in kilm.yaml (kilm init) or register a 3D library (kilm add-3d) to "
@@ -553,7 +557,6 @@ def import_zip(
         console.print("[yellow]Dry run - no changes will be made[/yellow]")
 
     totals: dict[str, list[str]] = {"sym": [], "fp": [], "models": []}
-    models = _existing_models(lib_path, models_dir, model_prefix)
 
     for zip_path in zip_files:
         zip_path = zip_path.expanduser().resolve()

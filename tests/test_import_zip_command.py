@@ -586,7 +586,10 @@ def test_model_in_other_models_dir_is_reused(
     result = _run_import(str(zip_path))
 
     assert result.exit_code == 0, result.output
-    assert "3D   skip (exists): Part.step" in result.output
+    assert (
+        "3D   reuse existing ${KICAD_LIB_MYLIB}/Bbb.3dshapes/Part.step for Part.step"
+        in result.output
+    )
     assert not (library_tree / "Aaa.3dshapes" / "Part.step").exists()
     fp = (
         library_tree / "footprints" / "SAMPLELIB.pretty" / "RFP.kicad_mod"
@@ -610,3 +613,31 @@ def test_fix_3d_path_handles_windows_separators():
     text = '(model "C:\\\\Vendor\\\\3D\\\\part.step"'
 
     assert _fix_3d_path(text, "${LIB}") == '(model "${LIB}/part.step"'
+
+
+def test_absolute_paths_from_other_model_dirs_are_warned(
+    tmp_path: Path, category_tree: Path
+):
+    (category_tree / "Old.3dshapes").mkdir()
+    (category_tree / "Old.3dshapes" / "Legacy.step").write_text("STEP")
+    zip_path = _zip_with(tmp_path, "W", {"W/3D/New.step": "STEP"})
+
+    result = _run_import("-s", "CAT_IC", "-f", "CAT_QFN", str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert "3D model paths will be absolute to this machine" in result.output
+
+
+def test_merge_symbols_adds_repeated_name_once(tmp_path: Path):
+    sym_lib = tmp_path / "SAMPLELIB.kicad_sym"
+    sym_lib.write_text(SAMPLE_SYM_LIB, encoding="utf-8")
+    src = tmp_path / "src.kicad_sym"
+    src.write_text(
+        '(kicad_symbol_lib\n\t(symbol "Twice"\n\t)\n\t(symbol "Twice"\n\t)\n)\n'
+    )
+
+    added, skipped = _merge_symbols(src, sym_lib, "SAMPLELIB", dry_run=False)
+
+    assert added == ["Twice"]
+    assert skipped == ["Twice"]
+    assert sym_lib.read_text().count('(symbol "Twice"') == 1
