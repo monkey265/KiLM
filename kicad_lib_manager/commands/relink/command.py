@@ -105,10 +105,13 @@ def _relink_refs(
     managed: dict[str, set[str]],
     known_nicknames: set[str],
     shadowed: set[str],
+    tables_complete: bool,
 ) -> None:
     # Cached symbol names present now or created by this pass, so two broken
     # cache entries for the same part are not both renamed to one name.
-    cached = set(re.findall(r'\(symbol "([^"]+:[^"]+)"', result.text))
+    cached: set[str] = set()
+    if pattern is _SYMBOL_REF_RE:
+        cached = set(re.findall(r'\(symbol "([^"]+:[^"]+)"', result.text))
 
     def _replace(m: re.Match[str]) -> str:
         nick, item = m.group(2), m.group(3)
@@ -116,6 +119,12 @@ def _relink_refs(
             broken = item not in managed[nick]
         else:
             broken = nick not in known_nicknames
+            if broken and not tables_complete:
+                # The nickname may live in a lib table that could not be read.
+                result.unresolved.append(
+                    f"{kind} {nick}:{item} (library tables incomplete, not rewritten)"
+                )
+                return m.group(0)
         if not broken:
             return m.group(0)
         candidates = sorted(provided_by.get(item, set()))
@@ -167,6 +176,7 @@ def relink_text(
     env: dict[str, str],
     shadowed_sym: Optional[set[str]] = None,
     shadowed_fp: Optional[set[str]] = None,
+    tables_complete: bool = True,
 ) -> RelinkResult:
     """Rewrite broken references in the text of a .kicad_sch or .kicad_pcb file.
 
@@ -175,6 +185,9 @@ def relink_text(
     project's symbol / footprint table redefines to point elsewhere; they are
     treated as foreign libraries.
     env resolves ${VAR} in 3D model paths (KIPRJMOD for relative ones).
+    With tables_complete False (a nested lib table could not be read),
+    references to unknown libraries are reported instead of rewritten;
+    items that left a managed library are still repaired.
     """
     result = RelinkResult(text)
     _relink_refs(
@@ -185,6 +198,7 @@ def relink_text(
         index.managed_symbol_libs,
         known_sym,
         shadowed_sym or set(),
+        tables_complete,
     )
     _relink_refs(
         result,
@@ -194,6 +208,7 @@ def relink_text(
         index.managed_footprint_libs,
         known_fp,
         shadowed_fp or set(),
+        tables_complete,
     )
 
     def _replace_model(m: re.Match[str]) -> str:
@@ -211,41 +226,6 @@ def relink_text(
 
     result.text = _MODEL_RE.sub(_replace_model, result.text)
     return result
-
-
-# Library dirs of a KiCad installation, by the suffix of the KICADn_* variable
-# KiCad defines for them at runtime (they are not stored in kicad_common.json).
-_INSTALL_SUBDIRS = {
-    "SYMBOL_DIR": "symbols",
-    "FOOTPRINT_DIR": "footprints",
-    "3DMODEL_DIR": "3dmodels",
-    "TEMPLATE_DIR": "template",
-}
-_INSTALL_SHARE_DIRS = (
-    "/usr/share/kicad",
-    "/usr/local/share/kicad",
-    "/app/share/kicad",
-    "/Applications/KiCad/KiCad.app/Contents/SharedSupport",
-)
-_KICAD_VERSIONS = range(5, 12)
-
-
-def _kicad_install_vars() -> dict[str, str]:
-    """Best-effort values for KiCad's built-in KICADn_*_DIR variables."""
-    shares = [Path(d) for d in _INSTALL_SHARE_DIRS]
-    shares += [
-        Path(f"C:/Program Files/KiCad/{v}.0/share/kicad") for v in _KICAD_VERSIONS
-    ]
-    share = next((d for d in shares if d.is_dir()), None)
-    if share is None:
-        return {}
-    install_vars: dict[str, str] = {}
-    for suffix, subdir in _INSTALL_SUBDIRS.items():
-        path = (share / subdir).as_posix()
-        install_vars[f"KICAD_{suffix}"] = path
-        for version in _KICAD_VERSIONS:
-            install_vars[f"KICAD{version}_{suffix}"] = path
-    return install_vars
 
 
 def _table_entries(
@@ -299,6 +279,60 @@ def _shadowed(
     return shadowed
 
 
+def _warn_missing_tables(missing: list[str]) -> None:
+    variables = sorted({v for m in missing for v in _VAR_RE.findall(m)})
+    console.print(
+        f"[yellow]Library tables not found: {', '.join(sorted(set(missing)))}[/yellow]"
+    )
+    hint = (
+        f"export {' '.join(f'{v}=...' for v in variables)} and rerun"
+        if variables
+        else "check the paths"
+    )
+    console.print(
+        "[yellow]References to libraries not otherwise known are reported, not "
+        f"rewritten. To include them, {hint}.[/yellow]"
+    )
+
+
+@dataclass
+class _ProjectTables:
+    env: dict[str, str]
+    known_sym: set[str]
+    known_fp: set[str]
+    shadowed_sym: set[str]
+    shadowed_fp: set[str]
+    complete: bool
+
+
+def _read_project_tables(
+    project_dir: Path,
+    env: dict[str, str],
+    index: LibraryIndex,
+    global_sym: set[str],
+    global_fp: set[str],
+    global_complete: bool,
+) -> _ProjectTables:
+    project_env = {**env, "KIPRJMOD": str(project_dir)}
+    missing: list[str] = []
+    project_sym = _table_entries(
+        project_dir / "sym-lib-table", project_env, missing=missing
+    )
+    project_fp = _table_entries(
+        project_dir / "fp-lib-table", project_env, missing=missing
+    )
+    if missing:
+        _warn_missing_tables(missing)
+    return _ProjectTables(
+        env=project_env,
+        known_sym=global_sym | set(project_sym),
+        known_fp=global_fp | set(project_fp),
+        shadowed_sym=_shadowed(project_sym, index.managed_symbol_paths, project_dir),
+        shadowed_fp=_shadowed(project_fp, index.managed_footprint_paths, project_dir),
+        complete=global_complete and not missing,
+    )
+
+
 def _project_files(paths: list[Path]) -> list[Path]:
     files: list[Path] = []
     for p in paths:
@@ -348,11 +382,7 @@ def relink(
             model_dirs[env_var] = Path(lib["path"])
 
     kicad_config = KiCadService.find_kicad_config_dir()
-    env = {
-        **_kicad_install_vars(),
-        **os.environ,
-        **KiCadService().get_environment_variables(kicad_config),
-    }
+    env = {**os.environ, **KiCadService().get_environment_variables(kicad_config)}
     missing: list[str] = []
     global_sym = set(
         _table_entries(kicad_config / "sym-lib-table", env, missing=missing)
@@ -365,12 +395,7 @@ def relink(
         )
         raise typer.Exit(1)
     if missing:
-        console.print(
-            "[red]KiCad's global library tables include tables that were not found: "
-            f"{', '.join(missing)}[/red]\n"
-            "[red]Define the variables they use in the environment and retry.[/red]"
-        )
-        raise typer.Exit(1)
+        _warn_missing_tables(missing)
 
     index = build_index(lib_paths, model_dirs)
     files = _project_files(paths)
@@ -383,19 +408,23 @@ def relink(
 
     changed_files = 0
     unresolved_total = 0
+    projects: dict[Path, _ProjectTables] = {}
     for f in files:
         project_dir = f.parent
-        project_env = {**env, "KIPRJMOD": str(project_dir)}
-        project_sym = _table_entries(project_dir / "sym-lib-table", project_env)
-        project_fp = _table_entries(project_dir / "fp-lib-table", project_env)
+        if project_dir not in projects:
+            projects[project_dir] = _read_project_tables(
+                project_dir, env, index, global_sym, global_fp, not missing
+            )
+        tables = projects[project_dir]
         result = relink_text(
             f.read_text(encoding="utf-8"),
             index,
-            global_sym | set(project_sym),
-            global_fp | set(project_fp),
-            project_env,
-            _shadowed(project_sym, index.managed_symbol_paths, project_dir),
-            _shadowed(project_fp, index.managed_footprint_paths, project_dir),
+            tables.known_sym,
+            tables.known_fp,
+            tables.env,
+            tables.shadowed_sym,
+            tables.shadowed_fp,
+            tables.complete,
         )
         if not result.changes and not result.unresolved:
             continue

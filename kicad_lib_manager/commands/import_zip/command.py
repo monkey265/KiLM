@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from collections.abc import Mapping, Set
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -50,13 +52,13 @@ def _merge_symbols(
     sym_lib: Path,
     lib_name: str,
     dry_run: bool,
-    elsewhere: frozenset[str] = frozenset(),
+    elsewhere: Set[str] = frozenset(),
     fp_libs: Optional[dict[str, str]] = None,
 ) -> tuple[list[str], list[str]]:
     """Append new symbols to sym_lib; skip names already in it or in elsewhere."""
     src_text = src_file.read_text(encoding="utf-8")
     dest_text = sym_lib.read_text(encoding="utf-8")
-    existing = {symbol_name(b) for b in extract_symbol_blocks(dest_text)} | elsewhere
+    existing = {symbol_name(b) for b in extract_symbol_blocks(dest_text)}
 
     added: list[str] = []
     skipped: list[str] = []
@@ -64,7 +66,7 @@ def _merge_symbols(
 
     for block in extract_symbol_blocks(src_text):
         name = symbol_name(block)
-        if name in existing:
+        if name in existing or name in elsewhere:
             skipped.append(name)
             continue
         block = _fix_footprint_ref(block, lib_name, fp_libs)
@@ -92,13 +94,20 @@ _MODEL_PATH_RE = re.compile(
 )
 
 
-def _fix_3d_path(text: str, model_prefix: str) -> str:
-    """Point every model path at model_prefix, e.g. "${KICAD_3D_MYLIB}"."""
+def _fix_3d_path(
+    text: str, model_prefix: str, prefixes: Optional[Mapping[str, str]] = None
+) -> str:
+    """Point every model path at model_prefix, e.g. "${KICAD_3D_MYLIB}".
+
+    prefixes maps model file names to the prefix of the dir that already
+    holds them; those win over model_prefix.
+    """
 
     def _replace(m: re.Match[str]) -> str:
         raw = m.group(1) if m.group(1) is not None else m.group(2)
-        filename = Path(raw).name
-        return f'(model "{model_prefix}/{filename}"'
+        filename = Path(raw.replace("\\", "/")).name
+        prefix = (prefixes or {}).get(filename, model_prefix)
+        return f'(model "{prefix}/{filename}"'
 
     return _MODEL_PATH_RE.sub(_replace, text)
 
@@ -200,6 +209,21 @@ def _symbol_names(sym_libs: list[Path]) -> set[str]:
     return names
 
 
+@dataclass
+class _RunState:
+    """What an import run has seen so far, shared by all its ZIPs.
+
+    Updated as parts are added (or would be, in a dry run), so later files
+    and ZIPs skip them and a dry run reports what a real run would do.
+    """
+
+    known_symbols: set[str]
+    # footprint name -> library holding it, for footprints added this run
+    footprints: dict[str, str] = field(default_factory=dict)
+    # model file name -> path prefix of the dir holding it (existing + added)
+    models: dict[str, str] = field(default_factory=dict)
+
+
 def _import_zip(
     zip_path: Path,
     sym_lib: Path,
@@ -208,26 +232,20 @@ def _import_zip(
     model_prefix: str,
     kicad_cli: Optional[Path],
     dry_run: bool,
-    known_symbols: Optional[set[str]] = None,
-    all_fp_dirs: Optional[list[Path]] = None,
-    run_fps: Optional[dict[str, str]] = None,
-    result: Optional[dict[str, list[str]]] = None,
-) -> dict[str, list[str]]:
-    """Import one ZIP into sym_lib / fp_dir.
+    all_fp_dirs: list[Path],
+    state: _RunState,
+    result: dict[str, list[str]],
+) -> None:
+    """Import one ZIP into sym_lib / fp_dir, recording progress in result.
 
-    Symbols named in known_symbols and footprints present in any of
-    all_fp_dirs (the other libraries of a split library) are skipped rather
-    than duplicated. known_symbols and run_fps (footprint name -> library
-    added earlier in this run) are updated in place, so later files and ZIPs
-    see this one's parts even in a dry run. Progress is recorded in result
-    as it happens, so a caller still knows what was written if this raises.
+    Symbols, footprints and models already in the library (any of its split
+    libraries / model dirs) or added earlier in the run are skipped rather
+    than duplicated; references point at wherever the existing copy lives.
+    result is filled as files are written, so the caller still knows what
+    was written if this raises part-way.
     """
-    known_symbols = known_symbols if known_symbols is not None else set()
-    run_fps = run_fps if run_fps is not None else {}
-    fp_dirs = [fp_dir] + [d for d in all_fp_dirs or [] if d != fp_dir]
+    fp_dirs = [fp_dir] + [d for d in all_fp_dirs if d != fp_dir]
     fp_libs: dict[str, str] = {}
-    if result is None:
-        result = {}
     for key in ("sym", "sym_skipped", "fp", "models"):
         result.setdefault(key, [])
 
@@ -246,15 +264,15 @@ def _import_zip(
             if f.suffix.lower() in (".stp", ".step") or f.name.lower().endswith(
                 (".stp.gz", ".step.gz")
             ):
-                dest = models_dir / f.name
-                if dest.exists() or f.name in result["models"]:
+                if f.name in state.models:
                     console.print(f"  3D   skip (exists): {f.name}")
-                else:
-                    console.print(f"  3D   add: {f.name}")
-                    if not dry_run:
-                        models_dir.mkdir(exist_ok=True)
-                        shutil.copy2(f, dest)
-                    result["models"].append(f.name)
+                    continue
+                console.print(f"  3D   add: {f.name}")
+                if not dry_run:
+                    models_dir.mkdir(exist_ok=True)
+                    shutil.copy2(f, models_dir / f.name)
+                state.models[f.name] = model_prefix
+                result["models"].append(f.name)
 
         # Footprints
         for f in tmp_path.rglob("*.kicad_mod"):
@@ -265,19 +283,22 @@ def _import_zip(
                 console.print(f"  FP   skip (exists{where}): {f.name}")
                 fp_libs[f.stem] = existing_in.stem
                 continue
-            if f.stem in run_fps:
+            if f.stem in state.footprints:
                 console.print(f"  FP   skip (added earlier in this run): {f.name}")
-                fp_libs[f.stem] = run_fps[f.stem]
+                fp_libs[f.stem] = state.footprints[f.stem]
                 continue
             console.print(f"  FP   add: {f.name}")
-            fp_libs[f.stem] = fp_dir.stem
-            run_fps[f.stem] = fp_dir.stem
             if not dry_run:
-                text = _fix_3d_path(f.read_text(encoding="utf-8"), model_prefix)
+                text = _fix_3d_path(
+                    f.read_text(encoding="utf-8"), model_prefix, state.models
+                )
                 f.write_text(text, encoding="utf-8")
                 _upgrade_fp(f, kicad_cli)
                 fp_dir.mkdir(exist_ok=True)
                 shutil.copy2(f, dest)
+            # Only now: a footprint whose write failed must not count as added.
+            fp_libs[f.stem] = fp_dir.stem
+            state.footprints[f.stem] = fp_dir.stem
             result["fp"].append(f.name)
 
         # Symbols
@@ -285,9 +306,9 @@ def _import_zip(
             if not dry_run:
                 _upgrade_sym(f, kicad_cli)
             added, skipped = _merge_symbols(
-                f, sym_lib, fp_dir.stem, dry_run, frozenset(known_symbols), fp_libs
+                f, sym_lib, fp_dir.stem, dry_run, state.known_symbols, fp_libs
             )
-            known_symbols.update(added)
+            state.known_symbols.update(added)
             for name in added:
                 console.print(f"  SYM  add: {name}")
             for name in skipped:
@@ -295,7 +316,32 @@ def _import_zip(
             result["sym"].extend(added)
             result["sym_skipped"].extend(skipped)
 
-    return result
+
+def _existing_models(
+    lib_path: Path, models_dir: Path, model_prefix: str
+) -> dict[str, str]:
+    """Model file name -> path prefix, for models already in the library.
+
+    Covers the target models dir and every other *.3dshapes dir of the
+    library, so an import reuses a model wherever it already lives.
+    """
+    lib_env_var = (read_github_metadata(lib_path) or {}).get("env_var")
+    dirs = [(models_dir, model_prefix)]
+    for d in sorted(lib_path.glob("*.3dshapes")):
+        if d.is_dir() and d.resolve() != models_dir.resolve():
+            prefix = (
+                f"${{{lib_env_var}}}/{d.name}"
+                if isinstance(lib_env_var, str) and lib_env_var
+                else d.resolve().as_posix()
+            )
+            dirs.append((d, prefix))
+    models: dict[str, str] = {}
+    for d, prefix in dirs:
+        if d.is_dir():
+            for f in d.iterdir():
+                if f.is_file():
+                    models.setdefault(f.name, prefix)
+    return models
 
 
 # ── Command ───────────────────────────────────────────────────────────────────
@@ -402,8 +448,8 @@ def _resolve_models(
 
     A 3D library registered with 'kilm add-3d' inside lib_path is used via its
     environment variable. Otherwise models go into the library's existing
-    *.3dshapes dir (one named after the library, or the only one; else
-    <default_name>.3dshapes), referenced through the
+    *.3dshapes dir (one named after the library, else the first; a new
+    <default_name>.3dshapes if there is none), referenced through the
     library's own environment variable from kilm.yaml, which 'kilm setup'
     defines in KiCad; without one, the absolute path is used.
     """
@@ -423,12 +469,13 @@ def _resolve_models(
         models_dir = named[0]
     elif len(existing) == 1:
         models_dir = existing[0]
+    elif existing:
+        models_dir = existing[0]
+        console.print(
+            f"[yellow]Several *.3dshapes dirs in {lib_path}; new models go to "
+            f"{models_dir.name} (register the right one with 'kilm add-3d')[/yellow]"
+        )
     else:
-        if existing:
-            console.print(
-                f"[yellow]Several *.3dshapes dirs in {lib_path}; register the right "
-                f"one with 'kilm add-3d'. Using {default_name}.3dshapes[/yellow]"
-            )
         models_dir = lib_path / f"{default_name}.3dshapes"
     lib_env_var = metadata.get("env_var")
     if isinstance(lib_env_var, str) and lib_env_var:
@@ -547,8 +594,10 @@ def import_zip(
             "in kilm.yaml (kilm init) or register a 3D library (kilm add-3d) to "
             "share the library.[/yellow]"
         )
-    known_symbols = _symbol_names(sym_candidates)
-    run_fps: dict[str, str] = {}
+    state = _RunState(
+        known_symbols=_symbol_names(sym_candidates),
+        models=_existing_models(lib_path, models_dir, model_prefix),
+    )
 
     # Resolve kicad-cli
     if kicad_cli_path is not None and not kicad_cli_path.exists():
@@ -615,9 +664,8 @@ def import_zip(
                 model_prefix,
                 kicad_cli,
                 dry_run,
-                known_symbols,
                 fp_candidates,
-                run_fps,
+                state,
                 r,
             )
         except Exception as exc:

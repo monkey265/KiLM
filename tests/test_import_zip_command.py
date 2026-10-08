@@ -798,3 +798,81 @@ def test_models_dir_prefers_library_named_dir(
     assert result.exit_code == 0, result.output
     assert (library_tree / "SAMPLELIB.3dshapes" / "M4.stp").exists()
     assert not (library_tree / "AAA.3dshapes" / "M4.stp").exists()
+
+
+# ── Review round 3 ────────────────────────────────────────────────────────────
+
+
+def test_model_in_other_models_dir_is_reused(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    (library_tree / "Aaa.3dshapes").mkdir()
+    (library_tree / "Bbb.3dshapes").mkdir()
+    (library_tree / "Bbb.3dshapes" / "Part.step").write_text("STEP")
+    (library_tree / "kilm.yaml").write_text("name: mylib\nenv_var: KICAD_LIB_MYLIB\n")
+    zip_path = _zip_with(
+        tmp_path,
+        "Reuse",
+        {
+            "R/KiCad/RFP.kicad_mod": '(footprint "RFP"\n\t(model "x/Part.step"\n\t)\n)\n',
+            "R/3D/Part.step": "STEP",
+        },
+    )
+
+    result = _run_import(str(zip_path))
+
+    assert result.exit_code == 0, result.output
+    assert "3D   skip (exists): Part.step" in result.output
+    assert not (library_tree / "Aaa.3dshapes" / "Part.step").exists()
+    fp = (
+        library_tree / "footprints" / "SAMPLELIB.pretty" / "RFP.kicad_mod"
+    ).read_text()
+    assert '(model "${KICAD_LIB_MYLIB}/Bbb.3dshapes/Part.step"' in fp
+
+
+def test_failed_footprint_write_is_not_counted_as_added(
+    tmp_path: Path,
+    library_tree: Path,
+    mock_config: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = {"n": 0}
+
+    def _fail_first(path: Path, kicad_cli: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "kicad_lib_manager.commands.import_zip.command._upgrade_fp", _fail_first
+    )
+    fp = {"S/KiCad/Shared.kicad_mod": '(footprint "Shared")\n'}
+    first = _zip_with(tmp_path, "first", fp)
+    second = _zip_with(tmp_path, "second", fp)
+
+    result = _run_import(str(first), str(second))
+
+    assert "Failed: first.zip" in result.output
+    assert "added earlier in this run" not in result.output
+    assert (
+        library_tree / "footprints" / "SAMPLELIB.pretty" / "Shared.kicad_mod"
+    ).exists()
+
+
+def test_dry_run_counts_shared_model_once(
+    tmp_path: Path, library_tree: Path, mock_config: MagicMock
+):
+    a = _zip_with(tmp_path, "a", {"A/3D/Shared.step": "STEP"})
+    b = _zip_with(tmp_path, "b", {"B/3D/Shared.step": "STEP"})
+
+    result = _run_import("--dry-run", str(a), str(b))
+
+    assert result.exit_code == 0, result.output
+    assert result.output.count("3D   add: Shared.step") == 1
+    assert "3D models  added: 1" in result.output
+
+
+def test_fix_3d_path_handles_windows_separators():
+    text = '(model "C:\\\\Vendor\\\\3D\\\\part.step"'
+
+    assert _fix_3d_path(text, "${LIB}") == '(model "${LIB}/part.step"'

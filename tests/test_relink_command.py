@@ -348,32 +348,6 @@ def test_shadowed_handles_unknown_vars_and_relative_uris(lib_tree: Path):
     assert _shadowed({"CAT_IC": str(rel)}, paths, project_dir) == set()
 
 
-def test_nested_table_uses_kicad_install_vars(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    from kicad_lib_manager.commands.relink import command
-
-    share = tmp_path / "share" / "kicad"
-    (share / "symbols").mkdir(parents=True)
-    (share / "template").mkdir()
-    (share / "template" / "sym-lib-table").write_text(
-        '(sym_lib_table\n\t(lib (name "Device")(type "KiCad")(uri "x")(options "")(descr ""))\n)\n'
-    )
-    monkeypatch.setattr(command, "_INSTALL_SHARE_DIRS", (str(share),))
-    table = tmp_path / "sym-lib-table"
-    table.write_text(
-        "(sym_lib_table\n"
-        '\t(lib (name "KiCad")(type "Table")(uri "${KICAD10_TEMPLATE_DIR}/sym-lib-table")(options "")(descr ""))\n'
-        ")\n"
-    )
-
-    missing: list[str] = []
-    entries = _table_entries(table, command._kicad_install_vars(), missing=missing)
-
-    assert set(entries) == {"Device"}
-    assert missing == []
-
-
 def test_unresolved_nested_table_is_reported(tmp_path: Path):
     table = tmp_path / "sym-lib-table"
     table.write_text(
@@ -387,17 +361,39 @@ def test_unresolved_nested_table_is_reported(tmp_path: Path):
     assert missing == ["${UNSET}/sym-lib-table"]
 
 
-def test_relink_cli_refuses_with_missing_nested_table(project: Path, tmp_path: Path):
+def test_missing_nested_global_table_degrades_instead_of_failing(
+    project: Path, tmp_path: Path
+):
     table = tmp_path / "kicad" / "sym-lib-table"
     table.write_text(
         table.read_text().replace(
             "(sym_lib_table\n",
-            '(sym_lib_table\n\t(lib (name "KiCad")(type "Table")(uri "/no/such/table")(options "")(descr ""))\n',
+            '(sym_lib_table\n\t(lib (name "KiCad")(type "Table")'
+            '(uri "${KICAD9_TEMPLATE_DIR}/sym-lib-table")(options "")(descr ""))\n',
         )
+    )
+    (project / "board.kicad_sch").write_text(
+        '(lib_id "OLD:ADC1")\n(lib_id "CAT_RF:ADC1")\n'
     )
 
     result = runner.invoke(app, ["relink", str(project)])
 
-    assert result.exit_code == 1
-    assert "were not found" in result.output
+    assert result.exit_code == 0, result.output
+    assert "export KICAD9_TEMPLATE_DIR=..." in result.output
+    assert "OLD:ADC1 (library tables incomplete, not rewritten)" in result.output
+    # A part that left a managed library is still repaired.
+    assert (project / "board.kicad_sch").read_text() == (
+        '(lib_id "OLD:ADC1")\n(lib_id "CAT_IC:ADC1")\n'
+    )
+
+
+def test_missing_nested_project_table_is_reported(project: Path):
+    (project / "sym-lib-table").write_text(
+        '(sym_lib_table\n\t(lib (name "Vendor")(type "Table")'
+        '(uri "${VENDOR_DIR}/sym-lib-table")(options "")(descr ""))\n)\n'
+    )
+
+    result = runner.invoke(app, ["relink", str(project)])
+
+    assert "Library tables not found: ${VENDOR_DIR}/sym-lib-table" in result.output
     assert (project / "board.kicad_sch").read_text() == '(lib_id "OLD:ADC1")\n'
