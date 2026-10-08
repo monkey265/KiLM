@@ -20,6 +20,7 @@ from .commands.import_zip import import_zip_app
 from .commands.init import init_app
 from .commands.list_libraries import list_app
 from .commands.pin import pin_app
+from .commands.relink import relink_app
 from .commands.setup import setup_app
 from .commands.status import status_app
 from .commands.sync import sync_app
@@ -164,6 +165,11 @@ app.add_typer(
     import_zip_app,
     name="import",
     help="Import SamacSys/Mouser/UltraLibrarian/SnapMagic KiCad ZIP(s) into the library",
+)
+app.add_typer(
+    relink_app,
+    name="relink",
+    help="Repoint broken library references in KiCad projects to managed libraries",
 )
 
 
